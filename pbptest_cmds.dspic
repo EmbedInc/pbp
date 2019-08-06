@@ -1,0 +1,266 @@
+;   ***************************************************************
+;   * Copyright (C) 2010, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   Command processing routines.
+;
+;   Most routines to process individual commands are in this module.  The
+;   general mechanics of command processing other than implementing individual
+;   commands is in the CMD module.
+;
+;   The interface to all command routines is the same.  The entry point to each
+;   command processing routine is named CM_xxx.  This naming convention is not
+;   used elsewhere in the system except for command processing routines.
+;
+;   Each command processing routine must follow these rules:
+;
+;     1 - TASK_YIELD must be called in a loop whenever waiting for a external
+;         event.
+;
+;     2 - Sending any data to the response stream must be preceeded by a call
+;         to CMD_LOCK_OUT.
+;
+;     3 - CMD_UNLOCK_OUT may only be called between whole responses.  It is not
+;         necessary to call CMD_UNLOCK_OUT after the last response.
+;
+;     4 - When done, execution must end up at CMD_DONE.  This can be done by
+;         explicitly jumping there.  It can also be done by executing a RETURN
+;         from the top nesting level.  The CMD_DONE return address is seeded
+;         onto the stack for this purpose before the command processing routine
+;         is run.  In other words, the command processing routine may act as a
+;         subroutine.
+;
+;         The stack will be reset to empty by CMD_DONE, so it is permissible to
+;         jump to CMD_DONE from a nested subroutine or with data left on the
+;         stack.  It is also permissible to call CMD_DONE, as may be necessary
+;         from a higher level language that has no ability to jump to a external
+;         address.
+;
+;         CMD_DONE will also release any output stream lock, so this need not be
+;         explicitly done by a command routine if sending a response is the last
+;         thing it does.
+;
+;   Several subroutines and other resources are available to command routines:
+;
+;     CMD_GET8
+;
+;       Gets the next command stream byte as a unsigned integer into W0.
+;
+;     CMD_GET8S
+;
+;       Gets the next command stream byte as a signed integer into W0.
+;
+;     CMD_GET16
+;
+;       Gets the next two command stream bytes as a 16 bit integer and returns
+;       it in W0.  The bytes are assumed to be in most to least significant
+;       order.
+;
+;     CMD_GET24U
+;
+;       Gets the next three command stream bytes as a 24 bit unsigned integer
+;       and returns it in W1:W0.  The bytes are assumed to be in most to least
+;       significant order.
+;
+;     CMD_GET24S
+;
+;       Gets the next three command stream bytes as a 24 bit signed integer and
+;       returns it in W1:W0.  The bytes are assumed to be in most to least
+;       significant order.
+;
+;     CMD_GET32
+;
+;       Gets the next four command stream bytes as a 32 bit integer and returns
+;       it in W1:W0.  The bytes are assumed to be in most to least significant
+;       order.
+;
+;     CMD_PUT8
+;
+;       Sends the byte in the low 8 bits of W0 out the response stream.  The
+;       response stream lock must be held when this routine is called.
+;
+;     CMD_PUT16
+;
+;       Sends the 16 bits in W0 out the response stream.  The bytes are sent
+;       in most to least significant order.  The response stream lock must be
+;       held when this routine is called.
+;
+;     CMD_PUT24
+;
+;       Sends the 24 low bits of W1:W0 out the response stream.  The bytes are
+;       sent in most to least significant order.  The response stream lock must
+;       be held when this routine is called.
+;
+;     CMD_PUT32
+;
+;       Sends the 32 bits in W1:W0 out the response stream.  The bytes are sent
+;       in most to least significant order.  The response stream lock must be
+;       held when this routine is called.
+;
+;     CMD_LOCK_OUT
+;
+;       Acquires the exclusive lock on the response stream.  Whole responses
+;       must be sent with this lock held to prevent them being interleaved with
+;       response data sent by other parts of the system asynchronously.
+;
+;     CMD_UNLOCK_OUT
+;
+;       Releases the lock on the response stream, if held by this task.  This
+;       may be called after sending a complete response to let other parts of
+;       the system send response data.  Any output stream lock held by this task
+;       is automatically released by CMD_DONE, so it is not necessary to call
+;       CMD_UNLOCK_OUT at the end of a command routine.
+;
+;       If a command routine sends multiple responses, it is permissible to
+;       hold the output lock continuously for all of them as long as the command
+;       routine does not wait on a external event.  Note that simply releasing
+;       the lock then acquiring it again without a call to TASK_YIELD in between
+;       is just a waste of cycles since no other task has the opportunity to
+;       acquire the lock while it is available.
+;
+;     CMD_PUTBUF
+;
+;       Writes the low 8 bits of W0 as the next sequential byte into the command
+;       routines scratch buffer.  The buffer starts at CMDBUF, and the global
+;       variable NCMDBUF contains the number of bytes currently in the buffer.
+;       The buffer is reset to empty before each command routine is run.  When
+;       the buffer is already full, attempts to write additional bytes to it are
+;       ignored.
+;
+;     CMD_PUTBUFN
+;
+;       Get the number of bytes indicated in W0 from the input stream and write
+;       them sequentially into the scratch buffer.
+;
+;     CMDBUF, NCMDBUF
+;
+;       These are the global symbols for accessing the scratch buffer.  CMDBUF
+;       is the first byte of the buffer, and NCMDBUF is the number of bytes in
+;       the buffer.  The buffer is reset to empty before each command is
+;       processed.
+;
+/include "pbptest.ins.dspic"
+
+;*******************************************************************************
+;
+;   Configuration constants.
+;
+/const   name    = ""        ;unique name to add to CMD_xxx symbols
+
+/include "(cog)src/dspic/cmds.ins.dspic"
+;
+;   Derived constants.
+;
+
+
+;*******************************************************************************
+;
+;   Variables.
+;
+;*******************
+;
+;   Global state.
+;
+.section .ram_cmds, bss
+
+;*******************
+;
+;   Local state.
+;
+
+
+.section .code_cmds, code
+;*******************************************************************************
+;
+;   Command VSET mv
+;
+;   Set the output voltage.  MV is the 16 bit unsigned millivolts to set the
+;   output to.
+;
+         glbent  cm_vset
+
+         gcall   cmd_get16   ;get the desired value in mV into W0
+         mov     #55000, w1  ;get max allowed value
+         cp      w0, w1
+         skip_leu            ;within range ?
+         mov     w1, w0      ;no, set to maximum allowed value
+         mov     w0, vreg    ;set the new output voltage regulation threshold
+         return
+
+;*******************************************************************************
+;
+;   Command GVSET
+;
+;   Send the VSET response, which indicates the output voltage set point.
+;
+         glbent  cm_gvset
+
+         gcall   cmd_lock_out
+         mov     #[v rsp_vset], w0
+         gcall   cmd_put8    ;send VSET response opcode
+
+         mov     vreg, w0    ;get the output setpoint
+         gcall   cmd_put16   ;send the output setpoint in mV
+         return
+
+;*******************************************************************************
+;
+;   Command ARM
+;
+;   Arm the trace mechanism, which means it is now looking for a trigger.
+;
+         glbent  cm_arm
+
+         setflag tracearm
+         return
+
+;*******************************************************************************
+;
+;   Command TRIG
+;
+;   Artificially trigger the trace mechanism.  The trace is first armed if it
+;   was not already previoiusly armed.
+;
+         glbent  cm_trig
+
+         setflag tracearm    ;make sure the mechanism is armed
+         gcall   trace_trigger ;cause the trigger event
+         return
+
+;*******************************************************************************
+;
+;   Command TOFF
+;
+;   Un-arm the trace mechanism.  Subsequent trigger events will be ignored, but
+;   data will still be captured into the circular buffer.
+;
+         glbent  cm_toff
+
+         clrflag tracearm    ;turn off armed mode
+         return
+
+;*******************************************************************************
+;
+;   Command BREAK
+;
+;   Sets the DBGBREAK flag.  This is used for debugging to execute instructions
+;   that a breakpoint has been set on.
+;
+         glbent  cm_break
+
+         setflag dbgbreak
+         return
+
+.end

@@ -1,0 +1,44 @@
+;   ***************************************************************
+;   * Copyright (C) 2015, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   This include file sets up the environment for the PBPTEST firmware.
+;
+/const   picname = "33EP32MC202" ;specific PIC model name
+/const   srcdir  = "pbp"     ;SOURCE directory containing this project
+/const   fwname  = "pbptest" ;name of this project
+/const   fwtype  integer = 43 ;unique ID for this firmware
+/const   using_c30 bool = false ;no C30 source modules included in build
+
+/include "(cog)src/dspic/std_def.ins.dspic"
+/include "(cog)src/dspic/fwtype.ins.dspic"
+;
+;   Set configuration for the standard routines and macros.
+;
+/const   clkpre  integer = 8 ;PLL block prescaler divide value, 2-33
+/const   clkmul  integer = 303 ;PLL block multiplier value, 2-513
+/const   clkpos  integer = 2 ;PLL block postscaler divide value, 2,4,8
+
+/block
+  /var local ff real
+  /set ff 7.37e6             ;start with internal fast RC oscillator frequency
+  /set ff [/ ff clkpre]      ;apply PLL block prescaler
+  /set ff [* ff clkmul]      ;apply PLL block multiplier
+  /set ff [/ ff clkpos]      ;apply PLL block postscaler
+  /const freq_osc real = ff  ;oscillator frequency, Hz
+  /const freq_inst real = [/ freq_osc 2] ;instruction cycle frequency, Hz
+  /endblock
+
+/include "(cog)src/dspic/std.ins.dspic"

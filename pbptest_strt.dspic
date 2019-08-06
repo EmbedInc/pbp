@@ -1,0 +1,303 @@
+;   ***************************************************************
+;   * Copyright (C) 2015, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   Top module for the PBPTEST project.  See the PBPTEST.INS.DSPIC include
+;   file for a description of the project.
+;
+/include "pbptest.ins.dspic"
+
+/block
+  /var local s string
+  /set s [str "Fosc = " [eng freq_osc 4] "Hz"]
+  /set s [str s ", Fcy = " [eng freq_inst 4] "Hz"]
+  /set s [str s ", Tcy = " [eng [/ 1 freq_inst] 4] "s"]
+  /show "  " s
+  /endblock
+/if [exist "fwtype"]
+  /then                      ;FWTYPE exists
+    /show "  Firmware type ID = " fwtype
+  /else                      ;FWTYPE does not exist
+    /show "  Firmware type ID not defined"
+  /endif
+/if debug_icd then
+  /show "  RealIce debugging enabled"
+  /endif
+
+;*******************************************************************************
+;
+;   Static processor configuration settings.
+;
+config   __FICD, 0b11001111
+                 ; 1------- reserved, must be 1
+                 ; -X------ unused
+                 ; --0----- disable JTAG
+                 ; ---0---- reserved, must be 0
+                 ; ----1--- reserved, must be 1
+                 ; -----X-- unused
+                 ; ------11 use PGEC1/PGED1 for debugging
+
+config   __FPOR, 0b11111111
+                 ; 11------ watchdog window 25% of period (not used)
+                 ; --1----- IIC2 on SDA2/SCL2 (not used)
+                 ; ---1---- IIC1 on SDA1/SCL1 (not used)
+                 ; ----1--- reserved, must be 1
+                 ; -----XXX unused
+
+config   __FWDT, 0b01111111
+                 ; 0------- watchdog timer enabled by firmware
+                 ; -1------ watchdog in non-window mode
+                 ; --1----- wait for PLL lock before clock switching
+                 ; ---1---- watchdog prescaler 128, not 32
+                 ; ----1111 watchdog postscaler 32768
+
+config   __FOSC, 0b01011011
+                 ; 01------ clock switching on, fail-safe clock monitor off
+                 ; --0----- allow multiple peripheral pin select changes
+                 ; ---XX--- unused
+                 ; -----0-- OSC2 is general I/O, not clock output
+                 ; ------11 disable primary oscillator
+
+config   __FOSCSEL, 0b00111000
+                 ;    0------- start with oscillator selected by <2:0>
+                 ;    -0------ do not require key sequence for PWM writes
+                 ;    --XXX--- unused
+                 ;    -----000 select internal fast RC oscillator
+
+config   __FGS,  0b11111111
+                 ; XXXXXX-- unused
+                 ; ------1- disable code protection
+                 ; -------1 disable write protection
+
+;*******************************************************************************
+;
+;   Reserve RAM for the ICD2.  It needs exclusive control over the first
+;   80 bytes.
+;
+/if debug_icdram then
+.equiv   __ICD2RAM, 1        ;linker reserves ICD2 RAM when this symbol defined
+.global  __ICD2RAM
+  /endif
+
+;*******************************************************************************
+;
+;   Define the global flag words.  These are defined in near RAM so that bit
+;   manipulation instructions can be used on them directly.  NFLAGB flag words
+;   need to be defined.
+;
+         flags_define
+
+;*******************************************************************************
+;
+;   Constants in program memory so that HEX file editing tools know the version
+;   of this firmware.
+;
+.section .fwinfo, code, address(0x800)
+         .pword  fwtype | (fwver << 8) | (fwseq << 16)
+
+
+.section .strt_code, code
+;*******************************************************************************
+;
+;   Start of exeuctable code.
+;
+/if using_c30
+  /then
+         glbent  _main       ;C runtime library jumps here after initialization
+  /else
+         glbent  __reset     ;jumps here directly from reset vector
+  /endif
+;
+;   Initialize the interrupt system.
+;
+         clr     Iec0        ;disable all interrupts
+.ifdef Iec1
+         clr     Iec1
+  .endif
+.ifdef Iec2
+         clr     Iec2
+  .endif
+.ifdef Iec3
+         clr     Iec3
+  .endif
+.ifdef Iec4
+         clr     Iec4
+  .endif
+
+.ifdef Ipc0                  ;init all interrupt priorties to 0 (disabled)
+         clr     Ipc0
+  .endif
+.ifdef Ipc1
+         clr     Ipc1
+  .endif
+.ifdef Ipc2
+         clr     Ipc2
+  .endif
+.ifdef Ipc3
+         clr     Ipc3
+  .endif
+.ifdef Ipc4
+         clr     Ipc4
+  .endif
+.ifdef Ipc5
+         clr     Ipc5
+  .endif
+.ifdef Ipc6
+         clr     Ipc6
+  .endif
+.ifdef Ipc7
+         clr     Ipc7
+  .endif
+.ifdef Ipc8
+         clr     Ipc8
+  .endif
+.ifdef Ipc9
+         clr     Ipc9
+  .endif
+.ifdef Ipc10
+         clr     Ipc10
+  .endif
+.ifdef Ipc11
+         clr     Ipc11
+  .endif
+.ifdef Ipc12
+         clr     Ipc12
+  .endif
+.ifdef Ipc13
+         clr     Ipc13
+  .endif
+.ifdef Ipc14
+         clr     Ipc14
+  .endif
+.ifdef Ipc15
+         clr     Ipc15
+  .endif
+.ifdef Ipc16
+         clr     Ipc16
+  .endif
+.ifdef Ipc17
+         clr     Ipc17
+  .endif
+.ifdef Ipc18
+         clr     Ipc18
+  .endif
+.ifdef Ipc19
+         clr     Ipc19
+  .endif
+.ifdef Ipc20
+         clr     Ipc20
+  .endif
+
+         clr     Intcon1     ;initialize interrupt system to defaults
+         clr     Intcon2
+         clr     Sr          ;make sure running with interrupt priority 0
+.ifdef Gie
+         bset    Intcon2, #Gie ;globally allow interrupts
+  .endif
+;
+;   Set up the stack.
+;
+         mov     #__SPLIM_init, w0 ;initalize stack limit register
+         mov     w0, Splim
+         nop                 ;needed after changing SPLIM
+         mov     #__SP_init, w15 ;initialize the stack pointer
+
+         flags_clear         ;initialize all the global flags to off
+;
+;   Set up the system clock as defined in the LIB file.  The processor is
+;   currently running from the internal oscillator.  It will be switched to the
+;   internal oscillator with the PLL chain defined by constants in the LIB file:
+;
+;     CLKPRE  -  PLL block prescaler divider, 2-33
+;     CLKMUL  -  PLL block multiplier, 2-513
+;     CLKPOS  -  PLL block postscaler divider, 2,4,8
+;
+         ;
+         ;   Set the CPU clock chain configuration as described above.  This
+         ;   does not actually change the clock, but configures how the PLL
+         ;   block will work when it is enabled.
+         ;
+.set     ii,     #0b0000000000000000 ;init the fixed CLKDIV fields
+                 ;  0--------------- interrupts don't change doze mode
+                 ;  -000------------ clock divided by 1 from normal in doze mode
+                 ;  ----0----------- disable doze mode
+                 ;  -----000-------- divide FRC by 1
+                 ;  --------XX------ PLL output divide select filled in below
+                 ;  ----------X----- unused
+                 ;  -----------XXXXX PLL input divide select filled in below
+.set     ii,     ii | ([- [div clkpos 2] 1] << 6) ;merge in PLL postscaler
+.set     ii,     ii | [- clkpre 2] ;merge in PLL prescaler
+         mov     #ii, w0
+         mov     w0, Clkdiv  ;set clock divisor register
+
+         mov     #[- clkmul 2], w0 ;set PLL multiplier value
+         mov     w0, Pllfbd
+         ;
+         ;   Switch to using the internal FRC oscillator with the PLL.  We are
+         ;   currently using the FRC directly without the PLL block.  The
+         ;   designers of this clock chain hardware were paranoid about errant
+         ;   code unintentionally switching the clock, so certain incantations
+         ;   must be muttered to "unlock" the high and low bytes of OSCCON
+         ;   separately to allow the new information for switching the clock to
+         ;   be written.
+         ;
+         mov     #0b00000001, w0 ;get new value for OSCCON high byte
+                 ;  X------- unused
+                 ;  -XXX---- current oscillator selection (read only)
+                 ;  ----X--- unused
+                 ;  -----001 select internal FRC oscillator with PLL
+         mov     #Osccon+1, w1 ;set pointer to high byte of OSCCON
+         mov     #0x78, w2   ;get the unlock values ready
+         mov     #0x9A, w3
+         mov.b   w2, [w1]    ;write the high byte unlock sequence
+         mov.b   w3, [w1]
+         mov.b   w0, [w1]    ;write new value to OSCCON high byte
+
+         mov     #0b00000001, w0 ;get new value for OSCCON low byte
+                 ;  0------- do not disable clock switching
+                 ;  -0------ allow peripheral pin select changes
+                 ;  --X----- read-only status bit
+                 ;  ---X---- unused
+                 ;  ----0--- clear any clock failure detected (not used)
+                 ;  -----XX- unused
+                 ;  -------1 start switchover from old to new clock source
+         mov     #Osccon, w1 ;set pointer to low byte of OSCCON
+         mov     #0x46, w2   ;get the unlock values ready
+         mov     #0x57, w3
+         mov.b   w2, [w1]    ;write the low byte unlock sequence
+         mov.b   w3, [w1]
+         mov.b   w0, [w1]    ;write new value to OSCCON low byte
+
+/if [or [not debug] debug_icd] then
+wait_clkswitch:              ;wait for clock switch
+         btsc    Osccon, #Oswen ;oscillator switchover is complete ?
+         jump    wait_clkswitch ;no, go back and check again
+  /endif
+;
+;   Initialize the separate modules.
+;
+         gcall   trap_init   ;init traps handler module
+         gcall   port_init   ;init I/O ports
+         gcall   clock_init  ;init clock tick hardware and ticks generator
+         gcall   task_init   ;init multi-tasking manager
+         gcall   trace_init  ;init data tracing facility
+         gcall   uart_init   ;init low level UART driver
+         gcall   cmd_init    ;init host command stream processing module
+         gcall   cmds_init   ;init command routines module
+         gcall   pulse_init  ;init power pulse generation module
+
+         gjump   init        ;continue with system-wide initialization
+
+.end

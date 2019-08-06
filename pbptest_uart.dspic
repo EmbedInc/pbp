@@ -1,0 +1,233 @@
+;   ***************************************************************
+;   * Copyright (C) 2015, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   UART handler.
+;
+;   This file references the generic UART.INS.DSPIC library file that contains
+;   the actual code.  This library file can be configured with the following
+;   preprocessor constants.  These must be set appropriately before the library
+;   file is included.
+;
+;     NAME, string
+;
+;       Unique name for the exported symbols.  May be the empty string.  This
+;       string is immediately appended to "UART" in each exported symbol name.
+;       For example, the routine UART_PUT will be called UART1_PUT when NAME is
+;       set to "1".  This mechanism is intended for supporting multiple UARTs in
+;       a system.  This would generally be the empty string when only one UART
+;       is used.
+;
+;     UN, integer
+;
+;       The hardware number of the UART to control in this module.  Usually the
+;       first UART is called UART1, the second UART2, etc.  This value is the 1
+;       or 2 in these names.  Set to 1 if this is for the only UART in the
+;       system.
+;
+;     BAUD, integer
+;
+;       Desired baud rate in bits/second.
+;
+;     PRIO_REG_RX, string
+;
+;       Name of the register containing the RX interrupt priority field.
+;
+;     PRIO_BIT_RX, integer
+;
+;       Number of the low bit of the RX interrupt priority field within its
+;       register.
+;
+;     RXPIN, integer
+;
+;       RPn pin number of the receive line.  This is ignored if no remappable
+;       pins on this processor.
+;
+;     RXPINREG, string
+;
+;       Must be resolvable by the assembler to the byte address of the register
+;       that selects the RPn or RPIn remappable pin number for the UART RX
+;       function.
+;
+;     PRIO_REG_TX, string
+;
+;       Name of the register containing the TX interrupt priority field.
+;
+;     PRIO_BIT_TX, integer
+;
+;       Number of the low bit of the TX interrupt priority field within its
+;       register.
+;
+;     TXPINREG, string
+;
+;       Must be resolvable by the assembler to the byte address of the register
+;       that sets the function of the TX remappable output pin.
+;
+;     TXPINID, integer
+;
+;       Remappable output ID for the UART TX function.
+;
+;     FIFOI_SZ, integer
+;
+;       Size of software input FIFO, bytes capacity.
+;
+;     FIFOO_SZ, integer
+;
+;       Size of software output FIFO, bytes capacity.
+;
+;     ALTPINS, bool
+;
+;       When true, causes the alternate UART RX and TX pins to be used.  When
+;       this constant does not exist or is false, the normal UART I/O pins are
+;       used.
+;
+;     HANDLE_OVERRUN, string
+;
+;       Preprocessor string constant.  The name of the routine to call when a
+;       UART receive overrun error is detected.  The UART receiver is first
+;       reset since the hardware can't recover from a overrun by itself.
+;
+;       The routine named by this constant is called from the UART receive
+;       interrupt, so must be careful about changing system state.  W0-W3 are
+;       saved by the interrupt routine and can therefore be trashed.  The
+;       remaining registers must not be trashed if the intent is to return to
+;       normal operation (as apposed to aborting, resetting the processor, etc).
+;
+;       The default when this constant does not exist or is the empty string is
+;       to reset the UART receiver and continue.
+;
+;     HANDLE_FRAMERR, string
+;
+;       Preprocessor string constant.  The name of the routine to call when a
+;       UART receive framing error is detected.  The byte received with the
+;       framing error is read and discarded before this routine is called.
+;
+;       The routine named by this constant is called from the UART receive
+;       interrupt, so must be careful about changing system state.  W0-W3 are
+;       saved by the interrupt routine and can therefore be trashed.  The
+;       remaining registers must not be trashed if the intent is to return to
+;       normal operation (as apposed to aboring, resetting the processor, etc).
+;
+;       The default when this constant does not exist or is the empty string is
+;       to discard the received byte with the framing error and continue.
+;
+;     HANDLE_RFULL, string
+;
+;       Preprocessor string constant.  The name of the routine to call when a
+;       UART byte is recevied but the software receive FIFO is full.  The byte
+;       is read from the UART and passed in W0.
+;
+;       The routine named by this constant is called from the UART receive
+;       interrupt, so must be careful about changing system state.  W0-W3 are
+;       saved by the interrupt routine and can therefore be trashed.  The
+;       remaining registers must not be trashed if the intent is to return to
+;       normal operation (as apposed to aboring, resetting the processor, etc).
+;
+;       The default when this constant does not exist or is the empty string is
+;       to discard the received byte when it can not be written into the receive
+;       FIFO.
+;
+;     LREADY, string
+;
+;       Name of signal defined with /OUTBIT that we assert when we are ready
+;       to receive characters.  If this constant is not defined or is the empty
+;       string then the software ready to receive feature is not included in the
+;       code (no flow control for receiving).
+;
+;     LREADY_N, integer
+;
+;       Number of slots in the input FIFO at or below which we will indicate not
+;       ready to receive more bytes.  When the input FIFO has room for
+;       LREADY_N+1 or more bytes, the LREADY line will be asserted, otherwise it
+;       will be de-asserted.  This value must be FIFOI_SZ-1 or less.
+;
+;     RREADY, string
+;
+;       Name of signal defined with /INBIT that is driven low by the remote
+;       system to indicate it is ready to receive data from us.  If this
+;       constant is not defined or is the empty string then the code to read
+;       the signal and stop sending accordingly is not included.  In that case,
+;       data is sent whenever it is ready (no flow control for sending).
+;
+;     RRINT, integer
+;
+;       Number of the INTn interrupt used to receive the RREADY signal.
+;
+;     RRINT_PRIOREG, string
+;
+;       Register that holds the selected RREADY INTn interrupt priority field.
+;
+;     RRINT_PRIOBIT, integer
+;
+;       Low bit of the RREADY INTn priority field within its register.
+;
+;     RRINT_FLGREGN, integer
+;
+;       Number of the IFSn and IECn registers that contain the flag and enable
+;       bits of the RREADY INTn interrupt.
+;
+;     RRINT_RP, integer
+;
+;       RPn or RPIn number of the remappable pin that the RREADY signal is
+;       tied to.  This is ignored on processors that do not have remappable
+;       pins.  In that case, the RREADY signal must be connected to the INTn
+;       input identified by RRINT.
+;
+;     RRINT_RPREG, string
+;
+;       Must be resolvalbe by the assembler to the byte address of the register
+;       that contains the remappable pin number for the INTn input selected by
+;       RRINT.
+;
+/include "pbptest.ins.dspic"
+
+;*******************************************************************************
+;
+;   Configuration constants.
+;
+/const   name    string = "" ;unique name for exported symbols, may be empty
+/const   un      integer = 1 ;1-N number of UART handled by this module
+/const   baud    real = 115200 ;desired baud rate
+
+/const   prio_reg_rx string = "Ipc2" ;register containing RX intr priority
+/const   prio_bit_rx integer = 12 ;low bit of priority field within register
+/const   rxpin   integer = 36 ;RPn pin number of receive line, 0 for not used
+/const   rxpinreg = "Rpinr18+0" ;reg to select RPn number for RX function
+
+/const   prio_reg_tx string = "Ipc3" ;register containing TX intr priority
+/const   prio_bit_tx integer = 0 ;low bit of priority field within register
+/const   txpinreg = "Rpor1+1" ;byte adr of reg for remappable output pin func ID
+/const   txpinid integer = 2#000001 ;remappable output ID for UART TX function
+
+/const   fifoi_sz integer = 32 ;software input FIFO size, capacity in bytes
+/const   fifoo_sz integer = 32 ;software output FIFO size, capacity in bytes
+/const   altpins bool = False ;do not use alternate UART pins
+/const   handle_overrun = "" ;routine to call from RX intr on hardware overrun
+/const   handle_framerr = "" ;routine to call from RX intr on framing error
+/const   handle_rfull = ""   ;routine to call from RX intr on software FIFO full
+
+/const   lready  = ""        ;signal we assert when ready to receive
+/const   lready_n integer = 8 ;not ready when input FIFO has this room or less
+
+/const   rready  = ""        ;input signal driven low when remote device ready to recv
+/const   rrint   integer = 1 ;number of INTn interrupt used for RREADY
+/const   rrint_prioreg = "Ipc5" ;register holding receive ready INTn intr priority
+/const   rrint_priobit integer = 0 ;low bit of priority field within register
+/const   rrint_flgregn integer = 1 ;IFSn and IECn reg number for RR INTn interrupt
+/const   rrint_rp integer = 52 ;RPn or RPIn number RREADY signal comes in on
+/const   rrint_rpreg = "Rpinr0+1" ;byte reg to select RRINT remappable pin number
+
+/include "(cog)src/dspic/uart.ins.dspic"
+         .end

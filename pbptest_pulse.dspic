@@ -1,0 +1,2454 @@
+;   This module manages producing the buck switcher pulses.  The input power can
+;   be from 15 to 55 Volts, and the output voltage as set by the global value
+;   VREG.
+;
+;   Four analog inputs are used in conjunction with the A/D:
+;
+;     AN0  -  Extra value not used by this algorithm.  The raw AN0 conversion
+;       result is left in AD_RA0 by the DMA peripheral, but nothing further is
+;       done with it here.
+;
+;     AN1  -  Measure of input voltage.  This is converted to unsigned
+;       millivolts and saved in VINMV each interrupt.
+;
+;     AN2  -  Measure of output voltage.  This is converted to usigned
+;       millivolts and save in VLAST each interrupt.
+;
+;     AN3  -  External reference voltage.  This is used as the positive
+;       reference of the A/D.  The constant VREF below indicates the voltage,
+;       and is used to generate the conversion factors to make millivolts from
+;       the other readings.
+;
+/include "pbptest.ins.dspic"
+
+;*******************************************************************************
+;
+;   Configuration constants.
+;
+/const   debug_qload bool = true ;explicitly compute load current
+/const   debug_qloadr bool = true ;compute load current assuming fixed RLOAD
+/const   debug_rload real = 10.0 ;assumed fixed load, Ohms
+
+
+/const   dper    real = 12e-6 ;desired PWM period, seconds
+/const   vref    real = 2.5  ;A/D full scale reference voltage
+/const   adfull  integer = 16#FFF0 ;raw A/D reading for full scale
+/const   adppwm  integer = 3 ;A/D readings per PWM period
+/const   maxvin  real = 55.0 ;max supported Vin, Volts
+/const   mintad  real = 117.6e-9 ;minimum required A/D Tad time, seconds
+/const   vinr1   real = 100e3 ;top resistor of Vin divider, Ohms
+/const   vinr2   real = 4700 ;bottom resistor of Vin divider, Ohms
+/const   voutr1  real = 6.380e3 ;top resistor of Vout divider, Ohms
+/const   voutr2  real = 10e3 ;bottom resistor of Vout divider, Ohms
+/const   sat     real = 3.5  ;inductor saturation current, Amps
+/const   vd      real = 0.7  ;volts accross diode during inductor discharge
+/const   l       real = 100e-6 ;inductor value, Henrys
+/const   cap     real = 301e-6 ;output capacitor value, Farads
+/const   i2pass  real = .95  ;fraction of computed I2 to pass to next cycle as I1
+/const   swon_on real = 100e-9 ;delay from SWON to switch on, seconds
+/const   swoff_off real = 300e-9 ;delay from SWOFF to switch off, seconds
+/const   dtoffon real = 250e-9 ;dead time to leave from off to on, seconds
+/const   dtonoff real = 250e-9 ;dead time to leave from on to off, seconds
+/const   minon   real = 1.00e-6 ;minimum allowed pulse time, seconds
+
+;   List the data value in each trace sample.  The name of the variable to
+;   capture each sample is in string constants "TRACEn", where N starts at 1 and
+;   increments sequentially.  The first TRACEn constant that does not exist
+;   defines the number of values to grab each sample.  If TRACE1 does not exist,
+;   then the trace mechanism is disabled.
+;
+/const   trace1  = "qload"   ;input voltage
+/const   trace2  = "vlast"   ;output voltage
+/const   trace3  = "i1"      ;inductor starting current
+/const   trace4  = "ton"     ;inductor on time
+
+/const   trigpos real = 0.5  ;0 to 1 trigger position within buffer
+;
+;   Derived constants.
+;
+/const   tcy     real = [/ 1 freq_inst] ;length of one instruction cycle, seconds
+/const   satma   integer = [rnd [* sat 1000 i2pass]] ;max ind curr to allow, mA
+
+/block                       ;start context for temporary local variables
+  /var local r real          ;scratch floating point
+  /var local r2 real
+  /var local ii integer      ;scratch integer
+  /var local s string        ;scratch string
+  /var local tk string
+  //
+  //   Global parameters for the PWM pulse.
+  //
+  /const adpinst integer = [rnd [/ [* freq_inst dper] adppwm]] ;cycles in A/D period
+  /const percy integer = [* adpinst adppwm] ;cycles in whole PWM period
+  /const tp real = [* tcy percy] ;actual PWM period, seconds
+  //
+  //   Switching pulse parameters.
+  //
+  /set r [+ dtoffon swon_on] ;delay to turn switch on
+  /set r2 [+ dtonoff swoff_off] ;delay to turn switch off
+  /const pstretch real = [- r2 r] ;effective pulse stretch time, seconds
+  /const stretchcy integer = [rnd [* pstretch freq_inst]] ;pulse stretch time, cycles
+  /set ii [trunc [* minon freq_inst]] ;make minimum allowed Ton in inst cycles
+  /set r [* ii tcy]          ;actual time represented by II
+  /if [< r minon] then       ;result is below the minimum ?
+    /set ii [+ ii 1]
+    /endif
+  /const mintoncy integer = ii ;min allowed Ton in instruction cycles
+  /const minton real = [* mintoncy tcy] ;min allowed Ton in seconds
+  /const cyoffon integer = [rnd [/ dtoffon tcy]] ;off-on dead time, cycles
+  /const cyonoff integer = [rnd [/ dtonoff tcy]] ;on-off dead time, cycles
+  //
+  //   Find A/D setup parameters.
+  //
+  /set ii [trunc [* mintad freq_inst]] ;whole instr cycles in MINTAD
+  /if [< [* tcy ii] mintad] then
+    /set ii [+ ii 1]
+    /endif
+  /const tadcy integer = ii  ;instruction cycles per Tad
+  /const tad real = [* tadcy tcy] ;Tad in seconds
+  /const adcs_field integer = [- tadcy 1] ;ADCS field value in ADxCON3
+  //
+  //   Find scale factors for the raw A/D readings.
+  //
+  /set r [/ vinr2 [+ vinr1 vinr2]] ;Vin voltage divider gain
+  /set r [/ vref r]          ;Vin for full scale reading
+  /set r [/ r adfull]        ;scale factor to make volts from shifted A/D reading
+  /set r [* r 1000]          ;scale factor to make mV
+  /const vin_mult integer = [rnd [* r 65536]] ;mult factor for result in high word
+
+  /set r [/ voutr2 [+ voutr1 voutr2]] ;Vout voltage divider gain
+  /set r [/ vref r]          ;Vout for full scale reading
+  /set r [/ r adfull]        ;scale factor to make volts from shifted A/D reading
+  /set r [* r 1000]          ;scale factor to make mV
+  /const vout_mult integer = [rnd [* r 65536]] ;mult factor for result in high word
+  //
+  //   Determine data tracing configuration.
+  //
+  /set ii 0                  ;init number of values to trace
+  /loop
+    /set s [str "trace" [+ ii 1]] ;make name of this TRACEn constant
+    /if [not [exist s]] then
+      /quit
+      /endif
+    /set ii [+ ii 1]         ;count one more word per sample
+    /endloop
+  /const ntrace integer = ii ;indicate number of words per trace sample
+  //
+  //   Show some of the configuration at build time.
+  //
+  /set s ""
+  /set s [str s "PWM period " [eng tp] "s (" percy " cycles)"]
+  /set s [str s ", frequency " [eng [/ 1 tp]] "Hz"]
+  /show "  " s
+
+  /set s ""
+  /set s [str s "A/D Tad " tadcy " cycles (" [eng tad] "s)"]
+  /set s [str s ", conversion " [* tadcy 14] " cycles"]
+  /set s [str s " (" [eng [* tad 14]] "s)"]
+  /show "  " s
+
+  /set s ""
+  /set s [str s "Deadtime off-on " [eng [* cyoffon tcy]] "s"]
+  /set s [str s ", on-off " [eng [* cyonoff tcy]] "s"]
+  /set s [str s ", pulse stretch " [eng pstretch] "s"]
+  /show "  " s
+
+  /if [> ntrace 0]
+    /then                    ;data tracing is enabled
+      /set s ""
+      /set s [str s "Tracing " ntrace " values:"]
+      /set ii 1
+      /loop
+        /if [> ii ntrace] then
+          /quit
+          /endif
+        /set tk [str "trace" ii] ;name of this TRACEn constant
+        /set tk [ucase [chars tk]] ;get upper case value of the constant
+        /set s [str s " " tk]
+        /set ii [+ ii 1]
+        /endloop
+      /show "  " s
+    /else                    ;data tracing is disabled
+      /show "  Data tracing disabled"
+    /endif
+  /endblock
+
+;*******************************************************************************
+;
+;   Variables.
+;
+;*******************
+;
+;   Global state.
+;
+.section .pulse, bss, near
+
+allocg   vreg                ;output regulation value, mV
+
+;*******************
+;
+;   Local state.
+;
+;   A consistant naming of variables and in comments is used for the pulses
+;   relative in time.  Each interrupt occurs shortly after the start of a pulse.
+;   The A/D started converting the output voltage at the start of the pulse, and
+;   the interrupt occurs after the A/D conversion is complete.
+;
+;   The pulse that is currently going on is "this" pulse, the previous is "last"
+;   pulse, and the next is "next" pulse.  Note that the output voltage
+;   measurement is from the result of the last pulse, the computations resulting
+;   from that are during this pulse, which are deciding what to do next pulse.
+;
+;       ________            ____                __
+;      |        |          |    |              |  |
+;   ___|        |__________|    |______________|  |________________
+;
+;      |                   |                   |                   |
+;      |<----- Last ------>|<----- This ------>|<----- Next ------>|
+;      |                   |                   |                   |
+;      |                   |<-><-------------->|                   |
+;                            | |      |       |
+;           A/D conversion __| |      |       new duty cycle written by here
+;                              |      |
+;                              |  computation time
+;          Interrupt starts here
+;
+;
+;   Unless otherwise noted, EMF values are in mV, current in mA, time in
+;   instruction cycles, and charge in units of mA * Tp.  This keeps the range
+;   within 16 bits but with sufficiently fine resolution when using integers.
+;   Charge per pulse and currents are then interhangeable.  For example, a
+;   current value of 17 means the current is 17 mA.  A charge value of 17 also
+;   means that the average current to transfer that charge in one pulse time is
+;   17 mA.
+
+;   Precomputed constants.  These values are known at build time and are put in
+;   near memory for fast access at run time.
+;
+alloc    satma               ;inductor saturation current, mA
+alloc    vdmv                ;diode drop during discharge phase, mV
+alloc    tpcy                ;cycles in full pulse period
+;
+;   Measured values.
+;
+alloc    vinmv               ;Vin, mV
+alloc    vlast               ;Vout at end of last pulse, mV
+;
+;   Persistant state kept between pulses.  This state is updated at the end of
+;   each pulse computation to be ready for the next pulse.
+;
+alloc    vprev               ;Vout at start of last pulse, mV
+alloc    i1                  ;inductor current at start of next pulse, mA
+alloc    qthis               ;charge being delivered this pulse, mA * Tp
+alloc    qlast               ;charge delivered last pulse, mA * Tp
+;
+;   Values that describe the next pulse.  These must be computed each iteration,
+;   and are used to update the peristant state (above) at the end of each pulse
+;   computation to be ready for the next computation.
+;
+alloc    i2                  ;inductor current at end of next pulse, mA
+alloc    qnext               ;charge that will be delivered next pulse, mA * Tp
+;
+;   Temporary variables during each control loop iteration.
+;
+/if debug_qload then
+alloc    qload               ;charge drawn by load last cycle
+  /endif
+
+alloc    qp                  ;charge to produce next pulse, mA * Tp
+alloc    von                 ;voltage on inductor when on (Vin - Vout), mV
+alloc    voff                ;voltage on inductor when off (Vout + Vd), mV
+alloc    ton                 ;inductor on time, instruction cycles
+alloc    ip                  ;peak inductor current, mA
+alloc    td                  ;inductor discharge time, instruction cycles
+
+alloc    xa                  ;quadratic coefficient A, shifted left XAS bits
+alloc    xas                 ;bits XA shifted left
+alloc    xb                  ;quadratic coefficient B, shifted left XBS bits
+alloc    xbs                 ;bits XB shifted left
+alloc    xc                  ;quadratic coefficient C, shifted left XCS bits
+alloc    xcs                 ;bits XC shifted left
+;
+;   Saved registers during pulse computation interrupt.
+;
+alloc    save_w4
+alloc    save_w5
+alloc    save_w6
+alloc    save_w7
+
+/if debug then
+         .global satma, vdmv
+         .global vinmv, vlast
+         .global vprev, ir, qthis, qlast
+         .global i2, qnext
+         .global gp, von, voff, ton, ip, td
+         .global xa, xas, xb, xbs, xc, xcs
+  /endif
+
+
+.section .pulse_code, code
+;*******************************************************************************
+;
+;   Subroutine PULSE_INIT
+;
+;   Initialize the hardware and software state managed by this module.  The
+;   hardware is initialized to the extent possible, but interrupts are not
+;   enabled and power supply processing is not performed.  This processing is
+;   started by calling PULSE_START.
+;
+         glbsub  pulse_init, regf0 | regf1
+;
+;   Init global state.
+;
+         mov     #[rnd [* voutdef 1000]], w0 ;init desired output voltage level
+         mov     w0, vreg
+;
+;   Set up the pre-computed constants kept in near memory.
+;
+         setvar  [v satma], satma ;inductor saturation limit
+         setvar  [rnd [* vd 1000]], vdmv ;diode drop during inductor discharge
+         setvar  [v percy], tpcy ;cycles in full period
+;
+;   Init the state from the previous pulse that is used to compute the next
+;   pulse.
+;
+         mov     #0, w0
+         mov     w0, vprev   ;init previous output voltage
+         mov     w0, i1      ;init starting inductor current
+         mov     w0, qthis   ;init charge being delivered this pulse
+         mov     w0, qlast   ;init charge delivered last pulse
+;
+;   Configure the A/D signals as analog inputs.  All inputs were configured to
+;   digital by the standard code in the PORT module.  This section therefore
+;   only needs to set the individual analog inputs it uses to analog.
+;
+         bset    ANSEL[chars Inbit_an0_port], #[v Inbit_an0_bit]
+         bset    ANSEL[chars Inbit_vin_port], #[v Inbit_vin_bit]
+         bset    ANSEL[chars Inbit_vout_port], #[v Inbit_vout_bit]
+         bset    ANSEL[chars Inbit_vref_port], #[v Inbit_vref_bit]
+;
+;   Set up timer 5 for the A/D conversion period.  The timer is set up but not
+;   yet started.
+;
+;   A timer event is need to trigger each individual A/D conversion.  Since we
+;   scan three channels, timer 5 must run at 3x the PWM rate.  The PWM period
+;   was computed to be a multiple of 3 instruction cycles.  3 timer 5 triggers
+;   will be exactly one PWM period.
+;
+;   The phase between timer 5 and the PWM period must be exact.  To achieve
+;   this, the timers are kept off for now and started as close to the same time
+;   as possible.  There is some inevitable delay between starting the timers.
+;   This delay is added to the timer start value so that it will be in sync
+;   once it gets going.
+;
+         mov     #0b0000000000000000, w0
+                 ;  0--------------- keep the timer off for now
+                 ;  -X-------------- unused
+                 ;  --0------------- continue in idle mode, not used
+                 ;  ---XXXXXX------- unused
+                 ;  ---------0------ disable timer gate (always running)
+                 ;  ----------00---- 1:1 prescaler
+                 ;  ------------X--- unused
+                 ;  -------------0-- don't sync external clock (not used)
+                 ;  --------------0- clock source is the instruction clock
+                 ;  ---------------X unused
+         mov     w0, T5con
+
+         mov     #[- [div percy 3] 1], w0 ;set the timer period
+         mov     w0, Pr5
+;
+;   Set up timer 2 to count over a whole PWM pulse.  This is only used for
+;   debugging to see how many instruction cycles are left in the current pulse.
+;
+/if debug then
+         mov     #0b0000000000000000, w0
+                 ;  0--------------- keep the timer off for now
+                 ;  -X-------------- unused
+                 ;  --0------------- continue in idle mode, not used
+                 ;  ---XXXXXX------- unused
+                 ;  ---------0------ disable timer gate (always running)
+                 ;  ----------00---- 1:1 prescaler
+                 ;  ------------0--- not part of 32 bit timer
+                 ;  -------------X-- unused
+                 ;  --------------0- clock source is the instruction clock
+                 ;  ---------------X unused
+         mov     w0, T2con
+
+         mov     #[- percy 1], w0 ;set the timer period
+         mov     w0, Pr2
+  /endif
+;
+;   Set up the A/D hardware.  The A/D is fully turned on and its interrupt
+;   enabled, but it won't do anything until timer 5 is turned on.
+;
+         mov     #0b0000011010000110, w0
+                 ;  0--------------- keep the A/D module off for now
+                 ;  -X-------------- unused
+                 ;  --0------------- continue in idle mode (not used)
+                 ;  ---X------------ DMA buffer fill mode (DMA not used)
+                 ;  ----X----------- not used
+                 ;  -----1---------- 12 bit (not 10 bit) operation
+                 ;  ------10-------- output format, 12 bits left-justified
+                 ;  --------1000---- end sampling and start conv on timer 5
+                 ;  ------------X--- not used in 12 bit mode
+                 ;  -------------1-- automatically sample on conversion done
+                 ;  --------------1- don't start conversion now
+                 ;  ---------------0 clear any conversion-done indication
+         mov     w0, Ad1con1
+
+         mov     #0b0010010000001000, w0
+                 ;  001------------- references are Vref+ and Vss
+                 ;  ---XX----------- unused
+                 ;  -----1---------- enable auto-scanning
+                 ;  ------XX-------- unused in 12 bit mode
+                 ;  --------X------- read-only status bit
+                 ;  ---------00010-- interrupt every 3 conv (one complete scan)
+                 ;  --------------0- fill output buffer from start
+                 ;  ---------------0 always use MUX A configuration
+         mov     w0, Ad1con2
+
+         mov     #0b0000000000000000 | [v adcs_field], w0
+                 ;  0--------------- clock is derived from system clock
+                 ;  -XX------------- unused
+                 ;  ---XXXXX-------- sample time, not used in auto-convert mode
+                 ;  --------XXXXXXXX ticks per Tad, from ADCS_FIELD, above
+         mov     w0, Ad1con3
+
+         mov     #0b0000000000000000, w0
+                 ;  XXXXXXX--------- unused
+                 ;  -------0-------- disable DMA
+                 ;  --------XXXXX--- unused
+                 ;  -------------XXX DMA buffer size
+         mov     w0, Ad1con4
+
+         mov     #0b0000000000000000, w0
+                 ;  0--------------- chan 0 mux B neg input is Vrefl
+                 ;  -XX------------- unused
+                 ;  ---00000-------- chan 0 mux B pos input is AN0
+                 ;  --------0------- chan 0 mux A neg input if Vrefl
+                 ;  ---------XX----- unused
+                 ;  -----------00000 chan 0 mux A pos input is AN0
+         mov     w0, Ad1chs0
+
+         clr     Ad1cssh     ;don't scan any of AN16-AN31
+         mov     #0b0000000000000111, w0 ;scan AN0-AN2
+         mov     w0, Ad1cssl
+
+         intr_priority Ipc3, 4, ipr_ad ;set the interrupt priority
+         bclr    Ifs0, #Ad1if ;clear any pending interrupt condition
+         bset    Iec0, #Ad1ie ;enable the A/D interrupt
+         bset    Ad1con1, #Adon ;turn on the A/D
+;
+;   Set up the PWM module.
+;
+         mov     #0b0010000000000000, w0
+                 ;  0--------------- keep the PWM module off for now
+                 ;  -X-------------- unused
+                 ;  --1------------- stop in idle mode
+                 ;  ---0------------ clear special event status indicator
+                 ;  ----0----------- disable special event interrupt
+                 ;  -----0---------- update period register at start of period
+                 ;  ------0--------- sync in and out is active high
+                 ;  -------0-------- disable primary time base sync output
+                 ;  --------0------- disable primary time base sync input
+                 ;  ---------000---- sync input select (not used)
+                 ;  ------------0000 special event trigger postscaler
+         mov     w0, Ptcon
+
+         mov     #0b0000000000000001, w0
+                 ;  XXXXXXXXXXXXX--- unused
+                 ;  -------------001 input clock prescaler of 2
+         mov     w0, Ptcon2
+
+         mov     #[- percy 1], w0 ;set primary master time base period
+         mov     w0, Ptper
+
+         clr     Mdc         ;init master duty cycle to 0
+
+         clr     Sevtcmp     ;set special event point within period, not used
+
+         mov     #0b0000000000000000, w0
+                 ;  0--------------- disable the chop clock
+                 ;  -XXXXX---------- unused
+                 ;  ------0000000000 chop clock divider (not used)
+         mov     w0, Chop
+         ;
+         ;   Set up the phase 1 PWM output.
+         ;
+         mov     #0b0000000100000000, w0
+                 ;  XXX------------- read-only status bits
+                 ;  ---0------------ disable fault interrupt
+                 ;  ----0----------- disable current limit interrupt
+                 ;  -----0---------- disable trigger interrupt
+                 ;  ------0--------- use master timebase
+                 ;  -------1-------- use master duty cycle
+                 ;  --------00------ positive dead time mode
+                 ;  ----------X----- not used in positive dead time mode
+                 ;  -----------X---- unused
+                 ;  ------------0--- use primary master time base
+                 ;  -------------0-- edge aligned mode (not center aligned)
+                 ;  --------------0- external reset input has no effect
+                 ;  ---------------0 registers updates held until start of period
+         mov     w0, Pwmcon1
+
+         mov     #0b1100000001010101, w0
+                 ;  1--------------- this module controls the PWM1H pin
+                 ;  -1-------------- this module controls the PWM1L pin
+                 ;  --0------------- PWM1H is active high
+                 ;  ---0------------ PWM1L is active low
+                 ;  ----00---------- complementary output mode
+                 ;  ------0--------- do not override PWM1H output
+                 ;  -------0-------- do not override PWM1L output
+                 ;  --------0------- override state for PWM1H output
+                 ;  ---------1------ override state for PWM1L output
+                 ;  ----------0----- PWM1H output in fault mode
+                 ;  -----------1---- PWM1L output in falut mode
+                 ;  ------------0--- PMW1H output in current limit mode
+                 ;  -------------1-- PWM1L output in current limit mode
+                 ;  --------------0- do not swap H and L outputs
+                 ;  ---------------1 output overrides apply start of next period
+         mov     w0, Iocon1
+
+         mov     #0b0000000000000011, w0
+                 ;  0--------------- normal fault mode, not independent mode
+                 ;  -00000---------- current limit input signal, not used
+                 ;  ------0--------- current limit input is active high
+                 ;  -------0-------- disable current limit input
+                 ;  --------00000--- fault input signal, not used
+                 ;  -------------0-- fault input is active high
+                 ;  --------------11 disable fault input
+         mov     w0, Fclcon1
+
+         clr     Pdc1        ;primary duty cycle, not used, comes from master
+
+         clr     Phase1      ;period counts phase ahead of master timebase
+
+         mov     #[v cyoffon], w0 ;set off to on dead time
+         mov     w0, Dtr1
+
+         mov     #[v cyonoff], w0 ;set on to off dead time
+         mov     w0, Altdtr1
+
+         clr     Trig1       ;trigger point, not used
+
+         mov     #0b0000000000000000, w0
+                 ;  0000------------ trigger output every event
+                 ;  ----XXXXXX------ unused
+                 ;  ----------000000 cycles to wait before first trigger
+         mov     w0, Trgcon1
+
+         mov     #0b0000000000000000, w0
+                 ;  0--------------- leading edge blanking ignores H rising edge
+                 ;  -0-------------- leading edge blanking ignores H falling edge
+                 ;  --0------------- leading edge blanking ignores L rising edge
+                 ;  ---0------------ leading edge blanking ignores L falling edge
+                 ;  ----0----------- leading edge blanking not applied to fault
+                 ;  -----0---------- leading edge blanking not applied to curr limit
+                 ;  ------XXXX------ unused
+                 ;  ----------0----- no blanking when blanking signal high
+                 ;  -----------0---- no blanking when blanking signal low
+                 ;  ------------0--- no blanking when H output is high
+                 ;  -------------0-- no blanking when H output is low
+                 ;  --------------0- no blanking when L output is high
+                 ;  ---------------0 no blanking when L output is low
+         mov     w0, Lebcon1
+
+         clr     Lebdly1     ;leading edge blanking delay of 0
+
+         mov     #0b0000000000000000, w0
+                 ;  XXXX------------ unused
+                 ;  ----0000-------- state blanking source = none
+                 ;  --------XX------ unused
+                 ;  ----------0000-- chop clock source select, unused
+                 ;  --------------0- disable chopping of H output
+                 ;  ---------------0 disable chopping of L output
+         mov     w0, Auxcon1
+
+         leaverest
+
+;*******************************************************************************
+;
+;   Subroutine PULSE_START
+;
+;   Start interrupts and power supply processing.  This module must have been
+;   previously initialized with a call to PULSE_INIT.
+;
+         glbsub  pulse_start, regf0 | regf1
+;
+;   Configure the trace system.  This will be used to take samples after each
+;   new pulse computation.
+;
+/if [> ntrace 0] then        ;data tracing is enabled ?
+  /var new ii integer
+
+         mov     #[v ntrace], w0 ;set number of data values per sample
+         gcall   trace_nwords
+
+  /set ii 1
+  /loop                      ;once for each value per sample
+    /if [> ii ntrace] then
+      /quit
+      /endif
+         mov     #[- ii 1], w0 ;pass 0-N number of this value
+         mov     #[chars trace[v ii]], w1 ;pass address of variable to read
+         gcall   trace_wordcfg ;configure this value within sample
+    /set ii [+ ii 1]
+    /endloop
+
+  /set ii [trunc [* trigpos 65536]]
+  /set ii [max 0 [min 65535 ii]]
+         mov     #[v ii], w0 ;pass the 0-65535 trigger position within trace buffer
+         gcall   trace_trigpos
+
+  /del ii
+  /endif
+;
+;   Timer 5 and the master PWM timebase must be in sync so that the last A/D
+;   conversion is triggered exactly at the end of PWM period.  Timer 5 has
+;   already been set to a sub-multiple of the PWM period.  However, since both
+;   can't be enabled at the same time, the timer 5 counter is advanced by the
+;   lag in starting it relative to the PWM generator.  The PWM generator counter
+;   has already been initialized to zero.  Note that bit instruction to non-CPU
+;   SFRs take 2 cycles on this processor.
+;
+         mov     #2, w0      ;init timer 5 to compensate for starting lag
+         mov     w0, Tmr5
+
+/if debug
+  /then                      ;debugging, start timer 2 also
+         mov     #4, w0      ;init timer 2 to compensate fo starting lag
+         mov     w0, Tmr2
+
+         disi    #6          ;guarantee these instructions are uninterrupted
+         bset    Ptcon, #Pten ;start the PWM generator
+         bset    T5con, #Ton ;start timer 5 two instruction cycles later
+         bset    T2con, #Ton ;start timer 2 four instruction cycles later
+  /else
+         disi    #4          ;guarantee these instructions are uninterrupted
+         bset    Ptcon, #Pten ;start the PWM generator
+         bset    T5con, #Ton ;start timer 5 two instruction cycles later
+  /endif
+
+         leaverest
+
+;*******************************************************************************
+;
+;   Command MVAL
+;
+;   Sends the MVAL response, which reports the latest measured analog input
+;   values.
+;
+         glbent  cm_mval
+
+         gcall   cmd_lock_out
+         mov     #[v rsp_mval], w0
+         gcall   cmd_put8    ;send MVAL response opcode
+
+         mov     Adc1buf0, w0 ;get the last AN0 raw reading value
+         lsr     w0, #12, w1 ;replicate the high bits into the unused low bits
+         ior     w0, w1, w0
+         gcall   cmd_put16   ;send AN0 reading, 0-65535 full scale
+
+         mov     vinmv, w0
+         gcall   cmd_put16   ;send input level, mV
+
+         mov     vlast, w0
+         gcall   cmd_put16   ;send output level, mV
+         return
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro NORM16U
+//
+//   Normalize the 32 bit unsigned integer in W1:W0 into the single 16 bit
+//   signed integer in W0.  W2 contains the number of bits the number is shifted
+//   left from its true value.  W2 will be updated to be the shift count for the
+//   result in W0.
+//
+//   W1 and W3 are trashed.
+//
+/macro norm16u
+  /write
+  /write "         ;   Save highest 15 bits in W0, update shift count in W2."
+  /write "         ;"
+
+         ff1l    w1, w3      ;find highest 1 bit in high word
+         bra     c, [lab highz] ;whole high word is 0 ?
+
+         add     w2, w3, w2  ;update the shift count
+         sub     #18, w2
+
+         sub     #2, w3      ;make bits to shift high word left
+         bra     gt, [lab highl] ;high word will be shifted left ?
+         bra     n, [lab highr] ;high word will be shifted right ?
+
+         mov     w1, w0      ;the high word is the result word
+         jump    [lab done]
+
+[lab highr]:
+         lsr     w1, #1, w0  ;result is high word shifted right one bit
+         jump    [lab done]
+         //
+         //   W3 contains the number of bits to shift the high word left to make
+         //   the high bits of the result word.
+         //
+[lab highl]:
+         sl      w1, w3, w1  ;move high bits of result into place
+         subr    w3, #16, w3 ;make bits to shift the low word right
+         lsr     w0, w3, w0  ;move low bits of result into place
+         ior     w0, w1, w0  ;assemble the final result
+         jump    [lab done]
+         //
+         //   The entire high word is 0.
+         //
+[lab highz]:
+         ff1l    w0, w3      ;find highest 1 bit in low word
+         bra     c, [lab done] ;entire value is 0, nothing to do ?
+
+         add     w2, w3, w2  ;update the shift count
+         sub     #2, w2
+
+         sub     #2, w3      ;make bits to shift left
+         bra     nn, [lab lowl] ;shifting left ?
+
+         lsr     w0, #1, w0  ;result is low word shifted right one bit
+         jump    [lab done]
+         //
+         //   W3 contains the number of bits to shift left.
+         //
+[lab lowl]:
+         sl      w0, w3, w0  ;do the shift
+
+[lab done]:
+  /write
+  /endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro NORM16S
+//
+//   Normalize the 32 bit signed integer in W1:W0 into the single 16 bit signed
+//   integer in W0.  W2 contains the number of bits the number is shifted left
+//   from its true value.  W2 will be updated to be the shift count for the
+//   result in W0.
+//
+//   W1 and W3 are trashed.
+//
+/macro norm16s
+  /write
+  /write "         ;   Save highest 15 bits in W0, update shift count in W2."
+  /write "         ;"
+
+         fbcl    w1, w3      ;find most significant bit
+         bra     c, [lab low] ;all high word bits are the same ?
+
+         sub     w2, w3, w2  ;update the shift count
+         sub     #16, w2
+
+         subr    w3, #0, w3  ;make bits to shift high word left
+         bra     nz, [lab highl] ;shift high word left ?
+
+         mov     w1, w0      ;the high word is the result word
+         jump    [lab done]
+
+[lab highl]:
+         sl      w1, w3, w1  ;make high bits of result
+         subr    w3, #16, w3 ;make bits to shift the low word right
+         lsr     w0, w3, w0  ;move low bits of result into place
+         ior     w0, w1, w0  ;assemble the final result
+         jump    [lab done]
+         //
+         //   All bits in the high word are the same.
+         //
+[lab low]:
+         xor     w0, w1, w3
+         btss    w3, #15     ;W0<15> is first significant bit ?
+         jump    [lab lowr]  ;no, just use low word
+         //
+         //   The high bit of W0 is the first significant bit.  This means it
+         //   has the opposite value from all the bits of the high word.
+         //
+         rlc     w1, w1      ;get the sign bit into C
+         rrc     w0, w0      ;shift sign bit into result word
+         add     #1, w2      ;update the shift count
+         jump    [lab done]
+         //
+         //   The value in W0 is self-contained.  The high bit of W0 is the sign
+         //   bit of the result.
+         //
+[lab lowr]:
+         fbcl    w0, w3      ;find most significant bit
+         bra     c, [lab done] ;value is either 0 or -1, nothing to do ?
+
+         sub     w2, w3, w2  ;update the shift count
+
+         neg     w3, w3      ;make bits to shift left
+         sl      w0, w3, w0  ;move first significant bit into W0<14>
+
+[lab done]:
+  /write
+  /endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro NORMAB
+//
+//   Normalize the two signed 32 bit values in W1:W0 and W5:W4 to have the same
+//   shift count.  The shift count for W1:W0 is in W2, and for W5:W4 is in W3.
+//   The value with the larger shift count will be right-shifted to match the
+//   scale of the value with the smaller shift count.  The shift counts in W2
+//   and W3 will be updated to reflect any changes made to the 32 bit values.
+//
+//   W6 and W7 are trashed.
+//
+/macro normab
+  /write
+  /write "         ;   Normalize W1:W0 and W5:W4 to the same shift count"
+  /write "         ;"
+
+         sub     w2, w3, w6  ;make bits to shift W1:W0 right
+         bra     z, [lab done] ;already at same scale, nothing to do ?
+         bra     lt, [lab shiftb] ;shift W5:W4 right ?
+         ;
+         ;   Shift W1:W0 right by W6 bits.
+         ;
+         ior     w5, w4, w7  ;check for other value is 0
+         bra     nz, [lab notzb] ;other value is not 0 ?
+         mov     w2, w3      ;other is 0, set it to our shift count
+         jump    [lab done]
+[lab notzb]:
+         sub     w2, w6, w2  ;update the shift count
+         cp      w6, #15
+         bra     geu, [lab highsa] ;high word will only contain sign
+         lsr     w0, w6, w0  ;move low bits of low word into place
+         asr     w1, w6, w7  ;make and save high word of result
+         subr    w6, #16, w6
+         sl      w1, w6, w1  ;make high bits of low word
+         ior     w0, w1, w0  ;assemble final low word
+         mov     w7, w1      ;put final value in the high word
+         jump    [lab done]
+[lab highsa]:
+         sub     #16, w6     ;amount to shift high word to make low word
+         cp      w6, #15
+         bra     geu, [lab allsa] ;whole result will only be sign ?
+         asr     w1, w6, w0  ;set low word of result
+         asr     w1, #15, w1 ;set high word of result
+         jump    [lab done]
+[lab allsa]:
+         asr     w1, #15, w1 ;propagate the sign into the whole result
+         mov     w1, w0
+         jump    [lab done]
+         ;
+         ;   Shift W5:W4 right by -W6 bits.
+         ;
+[lab shiftb]:
+         neg     w6, w6      ;make bits to shift W4:W5 right
+         ior     w1, w0, w7  ;check for other value is 0
+         bra     nz, [lab notza] ;other value is not 0 ?
+         mov     w3, w2      ;other is 0, set it to our shift count
+         jump    [lab done]
+[lab notza]:
+         sub     w3, w6, w3  ;update the shift count
+         cp      w6, #15
+         bra     geu, [lab highsb] ;high word will only contain sign
+         lsr     w4, w6, w4  ;move low bits of low word into place
+         asr     w5, w6, w7  ;make and save high word of result
+         subr    w6, #16, w6
+         sl      w5, w6, w5  ;make high bits of low word
+         ior     w4, w5, w4  ;assemble final low word
+         mov     w7, w5      ;put final value in the high word
+         jump    [lab done]
+[lab highsb]:
+         sub     #16, w6     ;amount to shift high word to make low word
+         cp      w6, #15
+         bra     geu, [lab allsb] ;whole result will only be sign ?
+         asr     w5, w6, w4  ;set low word of result
+         asr     w5, #15, w5 ;set high word of result
+         jump    [lab done]
+[lab allsb]:
+         asr     w5, #15, w5 ;propagate the sign into the whole result
+         mov     w5, w4
+
+[lab done]:
+  /write
+  /endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro SQRT
+//
+//   Take the square root of W1:W0 in place.  W1:W0 is assumed to be a unsigned
+//   integer.  W2 contains the shift count on entry, and will be updated.  This
+//   is the number of bits the true value was shifted left to make the number in
+//   W1:W0.
+//
+//   Trashes: W3, W4, W5
+//
+/macro sqrt
+  /var local ii integer
+;
+;   Take the square root of W1:W0 with shift count W2.  The result is written to
+;   the same registers.
+;
+         ff1l    w1, w3      ;find most significant bit in high word
+         bra     c, [lab highz] ;high word is all zero ?
+         sub     #1, w3      ;make number of bits to shift left
+         add     w2, w3, w4  ;make shift count after the shift
+         btsc    w4, #0      ;result is even ?
+         sub     #1, w3      ;no, shift one less bit left to make even shift count
+         add     w2, w3, w2  ;update the shift count to after the shift
+         cp0     w3
+         bra     z, [lab dnorm] ;nothing to shift, done normalizing the input ?
+         bra     gt, [lab shiftl] ;go shift W1:W0 left by W3 bits
+         bclr    Sr, #C      ;shift W1:W0 right one bit
+         rrc     w1, w1
+         rrc     w0, w0
+         jump    [lab dnorm] ;done making normalized number to take sqrt of
+[lab shiftl]:
+         sl      w1, w3, w1  ;get the high bits of the high word into position
+         sl      w0, w3, w4  ;make and save low word
+         subr    w3, #16, w3 ;make the low bits of the high word
+         lsr     w0, w3, w0
+         ior     w1, w0, w1  ;assemble the final high word
+         mov     w4, w0      ;get the final low word
+         jump    [lab dnorm]
+
+[lab highz]:
+         ff1l    w0, w3      ;find most significant bit in low word
+         bra     c, [lab zero] ;whole input number is zero, go return zero
+         sub     #1, w3      ;make number of bits to shift left
+         add     w2, w3, w4  ;make shift count after the shift
+         btsc    w4, #0      ;result is even ?
+         sub     #1, w3      ;no, shift one less bit left to make even shift count
+         add     w2, w3, w2  ;update the shift count to after the shift
+         add     #16, w2
+         btss    w3, #15     ;need to shift right ?
+         jump    [lab shiftll] ;do left shift
+         lsr     w0, #1, w1  ;right shift and place in high word
+         mov     #0, w0      ;set low word
+         jump    [lab dnorm] ;done making normalized value
+[lab shiftll]:
+         sl      w0, w3, w1  ;shift low word left and move to high word
+         mov     #0, w0      ;set low word
+         ;
+         ;   The number in W1:W0 has been normalized so that it is as large as
+         ;   possible with the shift count being even.  W2 is the shift count of
+         ;   the normalized number.
+         ;
+[lab dnorm]:
+         ;
+         ;   The square root is at most a 16 bit integer.  It will be found by
+         ;   successively finding its bits in most to least significant order.
+         ;   For each bit, the bit is set to 1, and the number is squared.  If
+         ;   the result is greater than the number to find the square root of,
+         ;   then the bit is cleared, else it is kept at 1.  For speed, this
+         ;   loop is unrolled.
+         ;
+         ;   The candidate square root will be built in W3 with W5:W4 used as
+         ;   the square of the candidate.
+         ;
+         mov     #0, w3      ;init the square root candidate
+  /set ii 16                 ;init number of last bit determined
+  /block                     ;back here to write the code for each iteration
+    /set ii [- ii 1]         ;make number of the bit to determine this iteration
+    /if [< ii 0] then        ;all done ?
+      /quit
+      /endif
+         bset    w3, #[v ii] ;set the bit to start the iteration
+         mul.uu  w3, w3, w4  ;square the candidate
+         cp      w4, w0      ;compare square to the input number
+         cpb     w5, w1
+         skip_leu
+         bclr    w3, #[v ii] ;square was too large, clear the bit
+    /repeat
+    /endblock
+         cp0     w3
+         bra     nz, [lab nonzero] ;not special case of returning zero ?
+         ;
+         ;   Return zero.
+         ;
+[lab zero]:
+         mov     #0, w0      ;return the zero
+         mov     #1, w1
+         mov     #1023, w2   ;return large shift count
+         jump    [lab done]
+         ;
+         ;   Returning a non-zero value.  W3 contains the largest value that
+         ;   when squared does not exceed W1:W0.  Since the result in W1:W0 will
+         ;   be interpreted as a signed number, the value in W3 is shifted right
+         ;   one bit so that the sign bit of the value returned in W1:W0 is 0.
+         ;
+[lab nonzero]:
+         lsr     w3, #1, w1  ;set high word of result
+         sl      w3, #15, w0 ;set low word of result
+         asr     w2, #1, w2  ;update shift count to square root
+         add     #15, w2     ;returning value in high word, shifted right 1
+[lab done]:
+  /write
+  /endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro SOLVE_QUADRATIC nosol
+//
+//   Solve the quadratic equation to get Ton.  The quadratic equation is
+//
+//     (A * Ton^2) + (B * Ton) + C = 0
+//
+//   The A, B, and C terms are in XA, XB, and XC, respectively.  Each of these
+//   are signed 16 bit values that have been shifted left by XAS, XBS, and XCS
+//   bits to maximally use the available resolution.
+//
+//   The result is left in W0.  If no solution to the quadratic exists, then
+//   execution is aborted to the label indicated by NOSOL.
+//
+//   Trashes: W1, W2, W3, W4, W5, W6, W7
+//
+/macro solve_quadratic
+;
+;   Solve the quadratic to get the desired Ton.
+;
+         ;
+         ;   B^2 - 4AC --> W1:W0, W2 shift count
+         ;
+         ;   Abort to PULSE_ZERO if this value is negative.
+         ;
+         mov     xb, w0      ;make B^2 into W1:W0
+         mul.ss  w0, w0, w0
+         mov     xbs, w2     ;make shift count for result in W2
+         add     w2, w2, w2
+
+         mov     xa, w4      ;make A*C into W5:W4
+         mov     xc, w5
+         mul.ss  w4, w5, w4
+         mov     xas, w3     ;make shift count for result in W3
+         mov     xcs, w6
+         add     w3, w6, w3
+         sub     #2, w3      ;account for the multiply by 4
+
+         normab              ;normalize both values to same shift count
+
+         sub     w0, w4, w0  ;do the subtract, B^2 - 4AC --> W1:W0
+         subb    w1, w5, w1
+         bra     n, [arg 1]  ;no solution, abort ?
+         ;
+         ;   The result is not negative.  Take the square root:
+         ;
+         ;     sqrt(B^2 - 4AC) --> W1:W0, W2 shift count
+         ;
+         sqrt                ;take square root of W1:W0, W2 shift count updated
+         ;
+         ;   Subtract B:
+         ;
+         ;     -B + sqrt(B^2 - 4AC) --> W1:W0, W2 shift count
+         ;
+         mov     xb, w5      ;get B into W5:W4, shift count in W3
+         mov     #0, w4
+         mov     xbs, w3
+         add     #16, w3
+
+         normab              ;normalize both 32 bit values to same shift count
+
+         sub     w0, w4, w0  ;subtract B from square root into W1:W0
+         subb    w1, w5, w1
+         ;
+         ;   Divide by 2A:
+         ;
+         ;     (-B + sqrt(B^2 - 4AC)) / 2A --> W0
+         ;
+         mov     xa, w4      ;get A in W4, shift count in W3
+         mov     xas, w3
+         ;
+         ;   Shift the value in W1:W0 right by one bit to guarantee that the
+         ;   divide does not overflow.  The single word quotient will be shifted
+         ;   later to account for the different shift counts of the numerator
+         ;   and denominator.
+         ;
+         asr     w1, w1      ;shift high word right 1, LSB into C
+         rrc     w0, w0
+
+         repeat  #17
+         div.sd  w0, w4      ;W1:W0 / W4 --> W0 remainder W1
+         ;
+         ;   Shift the result to account for the orignal shift amounts of the
+         ;   numerator and denominator.  The number of bits the numerator was
+         ;   shifted left from its true value are in W2, and the same for the
+         ;   denominator in W3.
+         ;
+         ;   The numerator was actually shifted one bit right before the divide,
+         ;   but W2 was not updated.  However, the denominator was really
+         ;   supposed to be twice the value actually divided by, although this
+         ;   has also not been reflected in W3.  The net result is that the
+         ;   number of bits to shift the quotient right is simply W2-W3.
+         ;
+         sub     w2, w3, w2  ;make shift number in W2
+         asr     w0, w2, w0  ;adjust result to true scale
+;
+;   W0 contains the solution of the quadratic.
+  /write ""
+  /endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro MAKE_IP
+//
+//   Compute the peak inductor current next pulse into IP.  The result will be
+//   written to IP and will be left in W0.  The following variables must be
+//   previously set:
+//
+//     Ton  -  Switch on-time in instruction cycles.
+//
+//   Trashes: W1, W2
+//
+/macro make_ip
+  /var local multf real      ;floating point multiplication factor
+  /var local im integer      ;integer mult factor, result in high word
+  /var local sh integer      ;number of bits value is shifted left
+  /var local shm real        ;mult factor of the left shift
+         ;
+         ;   Compute the peak inductor current, Ip.  In our units:
+         ;
+         ;          Von Ton Tcy
+         ;     Ip = ----------- + I1
+         ;               L
+         ;
+  /call shiftl_mult16u [/ tcy l] ;make MULTF, IM, SH, and SHM, best fit in 16 bits
+  /set sh [- sh 16]          ;make fraction bits in high word after multiply
+
+  /write "         ;   The Tcy/L constant is shifted so that the high word of the product"
+  /write "         ;   will have " sh " fraction bits."
+         ;
+         mov     von, w0     ;get Von
+         mov     #[v im], w1 ;get mult factor
+         mul.uu  w0, w1, w0  ;make Von * Tcy / L in W1, fraction bits
+         mov     ton, w0
+         mul.uu  w0, w1, w0  ;make current rise in W1:W0, fraction bits
+         add_half32 w1, w0, w2, [v sh] ;add 1/2 for rounding
+         shiftrl32l w1, w0, [v sh] ;shift off fraction bits to make curr rise in W0
+         add     i1, wreg    ;add initial inductor current
+         mov     w0, ip      ;save peak inductor current
+  /endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro MAKE_TD
+//
+//   Compute the inductor discharge time.  The result is written to Td and will
+//   be left in W0.  The following variables must be previously set:
+//
+//     Ip  -  Peak inductor current, mA.
+//
+//   Trashes W1, W2, W3
+//
+/macro make_td
+  /var local multf real      ;floating point multiplication factor
+  /var local im integer      ;integer mult factor, result in high word
+  /var local sh integer      ;number of bits value is shifted left
+  /var local shm real        ;mult factor of the left shift
+  /var local s string
+         ;
+         ;   Compute the inductor discharge time.  In our units:
+         ;
+         ;            Ip L
+         ;     Td = --------
+         ;          Voff Tcy
+         ;
+  /call shiftl_mult16u [/ l tcy] ;make MULTF, IM, SH, and SHM, best fit in 16 bits
+
+         mov     ip, w0      ;get Ip
+         mov     #[v im], w1 ;L / Tcy, shifted left SH bits
+  /set s "         mul.uu  w0, w1, w0"
+  /call startcomm s
+  /set s [str s "make IP * L / Tcy in W1:W0, " sh " fraction bits"]
+  /write s
+         shiftrl32 w1, w0, w2, [v sh] ;shift off the fraction bits
+
+         mov     voff, w2    ;get denominator
+         lsr     w2, #1, w3  ;add 1/2 denominator to numerator for rounding
+         add     w0, w3, w0
+         addc    #0, w1
+         repeat  #17
+         div.ud  w0, w2      ;divide by Voff to make Td in W0
+         skip_nov            ;quotient didn't overflow 16 bits ?
+         mov     #[+ percy 1], w0 ;overflowed, return more than max valid value
+         mov     w0, td      ;save final Td
+  /endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro MAKE_I2
+//
+//   Compute the ending inductor current.  The result will be written to I2 and
+//   left in W0.  The following variables must already be set:
+//
+//     IP  -  Peak inductor current, mA.
+//
+//     TD  -  Inductor discharge time, instruction cycles.
+//
+//   Trashes: W1, W2
+//
+/macro make_i2
+  /var local multf real      ;floating point multiplication factor
+  /var local im integer      ;integer mult factor, result in high word
+  /var local sh integer      ;number of bits value is shifted left
+  /var local shm real        ;mult factor of the left shift
+         ;
+         ;   Compute the ending inductor current, I2.  In our units:
+         ;
+         ;               Voff Td Tcy
+         ;     I2 = Ip - -----------
+         ;                    L
+         ;
+  /call shiftl_mult16u [/ tcy l] ;make MULTF, IM, SH, and SHM, best fit in 16 bits
+  /set sh [- sh 16]          ;fraction bits in high word of product
+
+  /write "         ;   The Tcy/L constant is shifted so that the high word of the product"
+  /write "         ;   will have " sh " fraction bits."
+         ;
+         mov     voff, w0    ;get Voff
+         mov     #[v im], w1 ;get mult factor
+         mul.uu  w0, w1, w0  ;make Voff * Tcy / L in W1, fraction bits
+         mov     td, w0
+         mul.uu  w0, w1, w0  ;make current decrease in W1:W0, fraction bits
+         add_half32 w1, w0, w2, [v sh] ;add 1/2 for rounding
+         shiftrl32l w1, w0, [v sh] ;shift off fraction bits to make curr drop in W0
+
+         cp      ip          ;compare starting current to current drop
+         skip_geu            ;ending current won't be negative ?
+         mov     ip, w0      ;would be negative, cause to be exactly 0 instead
+
+         sub     ip, wreg    ;make ending inductor current in W0
+         mov     w0, i2      ;save it
+  /write
+  /endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro MAKE_QNEXT
+//
+//   Compute the total charge that will be delivered next pulse.  The result
+//   will be written to QNEXT and left in W1.  The following variables must
+//   already be set:
+//
+//     IP  -  Inductor peak current, mA.
+//
+//     I2  -  Inductor ending current, mA.
+//
+//     TON  -  On-time, instruction cycles.
+//
+//     TD  -  Inductor discharge time, instruction cycles.
+//
+//   Trashes: W0, W2, W3
+//
+/macro make_qnext
+  /var local r real
+  /var local sh integer
+  /var local ii integer
+         ;
+         ;   Compute the total charge that will be delivered by this next pulse.
+         ;   In our units:
+         ;
+         ;           (I1 + Ip) Ton + (Ip + I2) Td
+         ;   Qnext = ----------------------------
+         ;                      2 Percy
+         ;
+  /set r [* satma percy 2]   ;maximum possible numerator value
+  /set sh [trunc [+ [log2 r] 1]] ;bits in maximum possible numerator
+  /set sh [max 0 [- sh 16]]  ;bits shift numerator right to fit in 16 bits
+  /set r [/ 1 [* 2.0 percy]] ;raw mult factor
+  /set r [* r [exp 2 sh]]    ;scale to shifted numerator
+  /set ii [rnd [* r 65536]]  ;integer mult factor for result in high word
+
+         mov     i1, w0
+         add     ip, wreg    ;make I1 + Ip in W0
+         mov     ton, w1
+         mul.uu  w0, w1, w2  ;make (I1 + Ip)Ton in W3:W2
+
+         mov     ip, w0
+         add     i2, wreg    ;make Ip + I2 in W0
+         mov     td, w1
+         mul.uu  w0, w1, w0  ;make (Ip + I2)Td in W1:W0
+
+         add     w0, w2, w0  ;make numerator in W1:W0
+         addc    w1, w3, w1
+         add_half32 w1, w0, w2, [v sh] ;add 1/2 for rounding
+         shiftrl32l w1, w0, [v sh] ;shift numerator right to fit into just W0
+
+         mov     #[v ii], w1 ;get mult factor for constant denominator
+         mul.uu  w0, w1, w0  ;make final result in W1
+         mov     w1, qnext   ;save it
+  /endmac
+
+;*******************************************************************************
+;
+;   A/D conversion done interrupt.
+;
+;   Each of the chanels enabled for scanning has been converted and the result
+;   stored in the A/D output buffer:
+;
+;     ADC1BUF0  -  Auxiliary external value, not used here.
+;
+;     ADC1BUF1  -  Input power voltage.
+;
+;     ADC1BUF2  -  Output power voltage.
+;
+         glbent  __AD1Interrupt
+/if debug_showintr then
+         bset    sync_lat, #sync_bit ;indicate start of interrupt
+  /endif
+         bclr    Ifs0, #Ad1if ;clear the interrupt condition
+         push.s              ;save W0-W3 and some status bits
+         mov     w4, save_w4 ;save additional registers that will be trashed
+         mov     w5, save_w5
+         mov     w6, save_w6
+         mov     w7, save_w7
+;
+;   Convert the raw A/D readings into normalized format in VINMV and VLAST.
+;   These values will be unsigned 16 bit integers in units of millivolts.
+;
+         mov     Adc1buf1, w0 ;get 12 bit input voltage reading
+         mov     #[v vin_mult], w1 ;get mult factor
+         mul.uu  w0, w1, w0  ;make mV in high word
+         mov     w1, vinmv   ;save measured input voltage
+
+         mov     Adc1buf2, w0 ;get 12 bit output voltage reading
+         mov     #[v vout_mult], w1 ;get mult factor
+         mul.uu  w0, w1, w0  ;make mV in high word
+         mov     w1, vlast   ;save measured output voltage
+
+
+
+//***** TEMP DEBUG *****
+//
+//   Set up test case with known values for testing computations.
+//
+/if false then
+pulse_debug:                 ;jumps here from init routine
+         setvar  25000, vinmv ;measured input, mV
+         setvar  15000, vreg ;output regulation level, mV
+         setvar  14990, vlast ;measured output, mV
+         setvar  14985, vprev ;output at start of last pulse, mV
+         setvar  50, i1      ;starting inductor current, mA
+         setvar  300, qthis  ;average mA delivered this pulse
+         setvar  200, qlast  ;average mA delivered last pulse
+  /endif
+//
+//***** END DEBUG *****
+
+
+
+;***************************************
+;
+;   Perform Vout control.  Ultimately this section results in a PWM duty cycle
+;   to load into the MDC register.  This will take effect at the start of the
+;   next pulse.
+;
+/block                       ;start context for temporary preprocessor variables
+  /var local ii integer      ;scratch integers
+  /var local jj integer
+  /var local sh integer      ;bits multiplication factor shifted left
+  /var local sh2 integer     ;shift amounts for additional intermediate terms
+  /var local sh3 integer
+  /var local r real          ;scratch floating point numbers
+  /var local r2 real
+;
+;   Pre-compute some common terms.
+;
+         mov     vlast, w0   ;save Vin - Vout as Von
+         sub     vinmv, wreg
+         mov     w0, von
+
+         mov     vlast, w0   ;save Vout + Vd as Voff
+         add     vdmv, wreg
+         mov     w0, voff
+;
+;   Check for special case where the measured Vin is less than the measured
+;   Vout, which should never actually happen anyway.  If so, just do a 0 length
+;   pulse.  The Vout > Vin case must be avoided because it is later assumed that
+;   Vin - Vout can fit in a 16 bit unsigned integer.
+;
+         mov     vinmv, w0   ;get the input voltage
+         cp      vlast       ;compare last measured output voltage to input voltage
+         bra     geu, pulse_zero ;Vout >= Vin, do a zero length pulse
+
+
+
+  /if debug_break then
+         skip_flag dbgbreak  ;breakpoint requested ?
+         jump    n_dbgbreak  ;no, skip this section
+         clr     Mdc         ;set duty cycle to 0 during single stepping
+         nop                 ;instruction to set breakpoint on
+         clrflag dbgbreak    ;clear the break event condition
+n_dbgbreak:
+    /endif
+
+
+
+//////////////////////////////
+//
+  /if [and debug_qload [not debug_qloadr]] then
+;
+;   Compute the charge taken by the load last cycle if this is enabled by
+;   DEBUG_QLOAD true.  Normally the charge drawn by the load is only implicitly
+;   included in the computation to determine the desired charge to produce next
+;   cycle.  For debugging, it can be useful to see the assumed load current
+;   directly.
+;
+;           (Vprev - Vlast) Cap
+;   Qload = ------------------- + Qlast
+;                   Tp
+;
+    /call shiftl_mult16u [/ cap tp] ;make MULTF, IM, SH, and SHM, best fit in 16 bits
+
+    /write "         ;   SH = " sh ", amount Cap/Tp shifted left"
+    /write "         ;"
+         mov     vlast, w0   ;get Vlast
+         sub     vprev, wreg ;make Vprev - Vlast
+         mov     #[v im], w1 ;get Cap/Tp mult factor
+         mul.su  w0, w1, w0  ;(Vprev - Vlast) Cap / Tp --> W1:W0
+         shiftra32 w1, w0, w2, [v sh] ;shift right into our normal units
+         add     qlast, wreg ;make final charge drawn by load last pulse
+         mov     w0, qload   ;save it for debugging
+    /endif                   ;end of compute Qload
+//
+//////////////////////////////
+//
+  /if [and debug_qload debug_qloadr] then
+;
+;   Compute the charge taken by the load, assuming the load is a fixed
+;   resistance of DEBUG_RLOAD Ohms.  This is enabled by DEBUG_QLOAD and
+;   DEBUG_QLOADR both being true.  In that case, DEBUG_RLOAD must be the fixed
+;   load resistance in Ohms.
+;
+;   Normally the load current is implicit in computing the desired charge to
+;   produce next pulse, without ever being computed directly.  It can be useful
+;   for debugging to see the load current that other values are based on.
+;
+;           Vlast
+;   Qload = -----
+;           Rload
+;
+    /set r [/ 1 debug_rload] ;raw mult factor
+    /set ii [rnd [* r 65536]] ;integer mult factor for result in high word
+
+         mov     vlast, w0   ;get the output voltage
+         mov     #[v ii], w1 ;get the 1/R mult factor
+         mul.uu  w0, w1, w0  ;Vout/Rload --> W1
+         mov     w1, qload   ;save load current
+
+    /endif
+//
+//////////////////////////////
+//
+  /if debug_qload then
+;
+;   Compute the charge to deliver next pulse into Qp.  This version of the
+;   computation is performed when the load current was previously computed
+;   in QLOAD.  Normally the load current is implicit in the desired output
+;   charge computation.  However, when it is already computed, the desired
+;   charge computation can be simplified.  It may also be useful for debugging
+;   to compute the load current differently than in the normal desired charge
+;   computation.
+;
+;        (Vreg - Vlast) Cap
+;   Qp = ------------------ - Qthis + 2 Qload
+;                Tp
+;
+    /call shiftl_mult16u [/ cap tp] ;make MULTF, IM, SH, and SHM, best fit in 16 bits
+    /set sh [- sh 3]         ;bits to shift right from what was computed
+    /set shm [exp 2 sh]      ;mult factor implied by SH
+    /set im [rnd [* multf shm]] ;make 16 bit integer mult factor
+
+    /write "         ;   SH = " sh ", amount Cap/Tp shifted left"
+    /write "         ;"
+
+         mov     vreg, w0
+         subr    vlast, wreg ;Vreg - Vlast --> W0, may be negative
+         mov     #[v im], w1
+         mul.su  w0, w1, w0  ;mult by Cap/Tp --> W1:W0 shifted left SH bits
+         shiftra32 w1, w0, w2, [v sh] ;shift into final units in W1:W0
+
+         subr    qthis, wreg ;- Qthis
+         subb    #0, w1
+
+         mov     qload, w2   ;make 2 Qload in W3:W2
+         mul.uu  w2, #2, w2
+         add     w0, w2, w0  ;add it into W1:W0
+         addc    w1, w3, w1
+
+         jump    qp_w1w0     ;desired charge next pulse is in W1:W0
+    /endif
+//
+//////////////////////////////
+//
+  /if [not debug_qload] then
+;
+;   Compute the charge to deliver next pulse into Qp.  In our units:
+;
+;          (Vreg + 2 Vprev - 3 Vlast) Cap
+;     Qp = ------------------------------ - Qthis + 2 Qlast
+;                        Tp
+;
+;   While each of the Vxxx and Qxxx inputs to this equation are unsigned 16 bit
+;   variables, the result of multiple additions and subtractions can be signed
+;   and exceed 16 bits.  The entire term may exceed our normal expression range.
+;   The whole term is computed in 32 bits, then range checked before proceeding.
+;   If the desired charge is negative or too large, then a zero pulse or maximum
+;   possible pulse is done, respectively.
+;
+    /call shiftl_mult16u [/ cap tp] ;make MULTF, IM, SH, and SHM, best fit in 16 bits
+    /set sh [- sh 3]         ;bits to shift right from what was computed
+    /set shm [exp 2 sh]      ;mult factor implied by SH
+    /set im [rnd [* multf shm]] ;make 16 bit integer mult factor
+
+    /write "         ;   SH = " sh ", amount Cap/Tp shifted left"
+    /write "         ;"
+
+         mov     vreg, w0    ;get Vreg into W1:W0
+         mov     #0, w1
+
+         mov     vprev, w2   ;make 2 Vprev in W3:W2
+         mul.uu  w2, #2, w2
+         add     w0, w2, w0  ;add it into W1:W0
+         addc    w1, w3, w1
+
+         mov     vlast, w2   ;make 3 Vlast in W3:W2
+         mul.uu  w2, #3, w2
+         sub     w0, w2, w0  ;subtract it from W1:W0
+         subb    w1, w3, w1
+         ;
+         ;   W1:W0 = Vreg + 2 Vprev - 3 Vlast  (may be negative)
+         ;
+         ;   This value is multiplied by IM, which is a 16 bit unsigned value.
+         ;   Since this machine can't multiply a 32 bit value by a 16 bit value,
+         ;   the multiply is done in two pieces, times the low and high words
+         ;   separately.  The two products added together form a 48 bit result:
+         ;
+         ;   IM x high word:  W3:W2
+         ;   IM x low word:      W1:W0
+         ;
+         ;   The resulting 48 bits is the value shifted left SH bits.  The scale
+         ;   of the multiply constant has been arranged so that the result fits
+         ;   into 16 bits.  W3 is therefore ignored.
+         ;
+         mov     #[v im], w4 ;get C/Tp shifted left SH bits
+         mul.su  w1, w4, w2  ;multiply high word by the constant into W3:W2
+         mul.uu  w0, w4, w0  ;multiply low word by the constant into W1:W0
+         add     w1, w2, w1  ;assemble low 32 bits of result in W1:W0
+         shiftra32 w1, w0, w2, [v sh] ;shift right into our normal units
+         ;
+         ;           (Vreg + 2 Vprev - 3 Vlast) Cap
+         ;   W1:W0 = ------------------------------
+         ;                         Tp
+         ;
+         subr    qthis, wreg ;minus Qthis
+         subb    #0, w1
+
+         mov     qlast, w2   ;make 2 Qlast in W3:W2
+         mul.uu  w2, #2, w2
+         add     w0, w2, w0  ;add it into W1:W0
+         addc    w1, w3, w1
+    /endif
+//
+//////////////////////////////
+         ;
+         ;   The final charge to deliver next pulse is in W1:W0.
+         ;
+         ;   Check for overflow and underflow.  If neither, save the result in
+         ;   Qp and continue.
+         ;
+qp_w1w0:
+         cp0     w1
+         bra     lt, pulse_zero ;negative, do a zero-length pulse ?
+         bra     gtu, pulse_max ;overflow, do a max-length pulse ?
+         cp      satma       ;compare max possible charge to desired
+         bra     leu, pulse_max ;more than we can possibly produce ?
+
+         mov     w0, qp      ;save charge to produce next pulse
+;
+;   Check for the minimum allowed Ton results in more delivered charge than
+;   desired or that it would saturate the inductor.  In that case just do a 0
+;   Ton pulse.  Checking for this here alleviates the need to check for these
+;   special cases in several other places later.  This also guarantees that the
+;   full solution to Ton later won't result in a negative Ton value.
+;
+;   The inductor current rise in a minimum pulse is:
+;
+;          Von * MinTon
+;     Ip = ------------
+;               L
+;
+;   MinTon and L are preprocessor constants in seconds and Henrys, repsectively.
+;   Von is a measured values available in mV.  Using these all these values
+;   directly results in a current in mA, which is the units we want.
+;
+;   MinTon / L is pre-computed and the result multiplied by 2^16.  This causes
+;   the result of the multiply in the desired units to be in the high word of
+;   the 32 bit result.
+;
+  /set r [/ minton l]        ;make raw mult factor
+  /set ii [rnd [* r 65536]]  ;make actual mult factor for result in high word
+         ;
+         ;   Find the current rise in the inductor from a minimum pulse.  The
+         ;   result will be in W1 in units of mA.
+         ;
+         mov     von, w0     ;get Von
+         mov     #[v ii], w1 ;(MinTon/L) mult factor for high word result
+         mul.uu  w0, w1, w0  ;inductor current rise in mA into W1
+         ;
+         ;   Do a zero-length pulse if this minimum additional inductor current
+         ;   would exceed the inductor saturation limit.
+         ;
+         mov     i1, w0      ;get inductor starting current
+         add     w0, w1, w0  ;make inductor peak current with minimum Ton
+         cp      satma       ;compare saturation level to Ip
+         bra     ltu, pulse_zero ;Ip would exceed the saturation limit ?
+         ;
+         ;   W0 contains the inductor peak current (Ip) for a minimum length
+         ;   pulse.  This has been checked to not exceed the saturation limit.
+         ;
+         ;   Now compute the inductor ending current (I2).  If this is computed
+         ;   to be negative, then the pulse is discontinuous.  In that case, the
+         ;   the inductor current goes to zero and then stays zero before the
+         ;   end of the pulse.  This case needs to be detected because the
+         ;   charge delivered by the pulse is computed differently for
+         ;   continuous and discontinuous mode.
+         ;
+         ;   Since the on-time is known up front (MinTon) in this case, the off
+         ;   time is also known (Tp - MinTon).  The inductor current decrease
+         ;   during this discharge time is:
+         ;
+         ;          Voff (Tp - MinTon)
+         ;     Id = ------------------
+         ;                  L
+         ;
+         ;   (Tp - MinTon) / L is precomputed and multiplied by 2^16 so that Id
+         ;   is available directly in units of mA in the high word of the
+         ;   product.
+         ;
+  /set r [/ [- tp minton] l] ;make raw mult factor
+  /set ii [rnd [* r 65536]]  ;make actual mult factor for result in high word
+
+         mov     voff, w2    ;get Voff
+         mov     #[v ii], w3 ;(Tp-MinTon)/L mult factor for high word result
+         mul.uu  w2, w3, w2  ;make Id in W3
+
+         cp      w3, w0      ;compare Id to Ip
+         bra     gtu, minp_disc ;minimum pulse is discontinuous ?
+         ;
+         ;   The minimum pulse is continuous, meaning the inductor current will
+         ;   be non-zero at the end of the pulse.
+         ;
+         sub     w0, w3, w2  ;make ending inductor current (I2)
+         ;
+         ;   Register contents:
+         ;
+         ;     W0  -  Ip, peak inductor current for minimum pulse.
+         ;
+         ;     W2  -  I2, inductor current at the end of the pulse.
+         ;
+         ;   Now compute the charge delived by this pulse and do a zero-length
+         ;   pulse if it exceeds the charge to deliver next pulse (Qp).
+         ;
+         ;   The charge delivered by a continuous mode, in our units, is:
+         ;
+         ;            (Ip + I1) Ton   (Ip + I2) Td
+         ;     Qmin = ------------- + ------------
+         ;                 2 Tp           2 Tp
+         ;
+         ;   Ton is the on-time, which is the known constant MinTon in this
+         ;   case.  Td is the inductor discharge time, which is the constant
+         ;   Tp - MinTon.  The mult factors will be scaled so that the desired
+         ;   value will be available directly in the high word of the 32 bit
+         ;   result.  This scaling will also take the 2 in the denominator into
+         ;   account.
+         ;
+         ;   To result in our units of charge, which is mA * Tp, the above value
+         ;   must be divided by Tp.  This is also taken into account in the
+         ;   pre-computed multiplication constants.
+         ;
+  /set r [/ [- tp minton] [* 2.0 tp]] ;make raw mult factor for second term
+  /set ii [rnd [* r 65536]]  ;make actual mult factor for result in high word
+
+         add     w0, w2, w2  ;Ip + I2 --> W2
+         mov     #[v ii], w3 ;(Td/2Tp) mult factor for high word result
+         mul.uu  w2, w3, w2  ;solve second term into W3
+
+  /set r [/ minton [* 2.0 tp]] ;make raw mult factor for first term
+  /set ii [rnd [* r 65536]]  ;make actual mult factor for result in high word
+
+         add     i1, wreg    ;Ip + I1 --> W0
+         mov     #[v ii], w1 ;(Ton/2Tp) mult factor for high word result
+         mul.uu  w0, w1, w0  ;solve first term into W1
+
+         add     w1, w3, w0  ;total charge delivered by min pulse into W0
+         cp      qp          ;compare desired charge to min pulse charge
+         bra     ltu, pulse_zero ;min pulse delivers too much charge ?
+         jump    mode_cont   ;no, do full continuous mode solution
+         ;
+         ;   The minimum pulse is discontinuous, meaning the inductor current
+         ;   reaches zero before the end of the pulse.
+         ;
+minp_disc:                   ;mininum pulse is discontinuous
+         ;
+         ;   Register contents:
+         ;
+         ;     W0  -  Ip, peak inductor current for minimum pulse.
+         ;
+         ;     W1  -  Unused.
+         ;
+         ;     W2  -  Unused.
+         ;
+         ;     W3  -  Unused.
+         ;
+         ;     W4  -  Unused.
+         ;
+         ;     W5  -  Unused.
+         ;
+         ;     W6  -  Unused.
+         ;
+         ;     W7  -  Unused.
+         ;
+         ;   Compute the charge delivered by this minimum pulse.  The charge
+         ;   delivered by a discontinuous pulse is:
+         ;
+         ;            (I1 + Ip) Ton   Ip Td
+         ;     Qmin = ------------- + -----
+         ;                  2           2
+         ;
+         ;   After substituting the expression for Td, the discharge time, and
+         ;   adding the scale factors given the input and output units, the
+         ;   total computation is:
+         ;
+         ;            (I1 + Ip) Ton    Ip^2 L
+         ;     Qmin = ------------- + ---------
+         ;                2 Tp        Voff 2 Tp
+         ;
+         ;   The second term will be computed first since it is more complex and
+         ;   requires more resources.  L/(2 Tp) is a constant that is
+         ;   pre-computed.
+         ;
+  /set r [/ l [* 2 tp]]      ;make raw mult factor for second term
+  /set sh 8                  ;number of fraction bits to use
+  /set shm [exp 2 sh]        ;mult factor implied by SH
+  /set ii [rnd [* r shm]]    ;make actual mult factor for SH fraction bits
+
+  /write "         ;   SH = " sh ", number of fraction bits to use"
+  /write "         ;"
+         mov     w0, w4      ;temp save Ip in W4
+
+         mov     #[v ii], w1 ;(L/2Tp) mult factor, SH fraction bits
+         mul.uu  w0, w1, w0  ;(Ip L)/(2 Tp) --> W1:W0, SH fraction bits
+         add     #[shiftl 1 [- sh 1]], w0 ;add 1/2 for rounding
+         addc    #0, w1
+         shiftrl32l w1, w0, [v sh] ;make result with 0 fraction bits in W0
+         mul.uu  w0, w4, w0  ;(Ip^2 L)/(2 Tp) --> W1:W0
+
+         mov     voff, w2    ;divide by Voff into W0
+         repeat  #17
+         div.ud  w0, w2      ;second term result into W0
+
+  /set r [/ minton [* 2.0 tp]] ;make raw mult factor for first term
+  /set ii [rnd [* r 65536]]  ;make actual mult factor for result in high word
+
+         mov     i1, w2      ;make I1 + Ip in W2
+         add     w2, w4, w2
+         mov     #[v ii], w3 ;(Ton/2Tp) mult factor for high word result
+         mul.uu  w2, w3, w2  ;make first term result in W3
+
+         add     w0, w3, w0  ;add first and second terms to make Qmin in W0
+         cp      qp          ;compare desired charge with charge from min pulse
+         bra     ltu, pulse_zero ;min pulse delivers too much charge ?
+;
+;   Decide whether this pulse will be in continuous or discontinuous mode.
+;   Continuous mode means there will be some (non-zero) current in the inductor
+;   at the end of the pulse.  It is useful to decide this up front since different
+;   equations have to be solved to find Ton depending on which mode the pulse
+;   will be in.  These envolve solving quadratics with the associated square root,
+;   so it is better to do a few simpler calculations up front to determine which
+;   quadartic to solve, than to solve one and find the other needs to be solved.
+;
+;   The pulse will be in discontinuous mode if the maximum charge that can be
+;   delivered that way is sufficient, or the maximum discontinuous pulse would
+;   result in exceeding the inductor saturation current anyway.
+;
+;   To determine which mode, we first solve for the Ton value that causes the
+;   inductor current to get to exactly 0 at the end of the pulse.  From that we
+;   can calculate the inductor peak current, check that against the saturation
+;   current, and compute the delivered charge from this maximum discontinuous mode
+;   pulse.
+;
+;   It has already been determined that the minimum allowed Ton (other than 0)
+;   results in a discontinous pulse, that this pulse would not saturate the
+;   inductor, and that the resulting delivered charge is less than desired.  In
+;   other words, we already know Ton will be at least MINON.
+;
+         ;
+         ;   Find Ton at the continuous/discontinuous boundary.  This is the Ton
+         ;   at which the inductor current just reaches zero at the end of the
+         ;   pulse time.  The equation for this Ton, using normal MKS units is:
+         ;
+         ;           Voff * Tp - I1 * L
+         ;     Ton = ----------------------
+         ;                 Vin + Vd
+         ;
+         ;   Our voltage values (Voff, Vin, Vd) are in units of mV and currents
+         ;   (I1) in units of mA.  The equation above therefore results in Ton
+         ;   in units of seconds using our values in the scale they are
+         ;   available in.
+         ;
+         ;   However, to best express Ton in a 16 bit integer, we will use units
+         ;   of instruction cycles.  This is also the minimum time resolution we
+         ;   can control anything in.  Both terms of the numerator will
+         ;   therefore be divided by Tcy.  The two numerator terms will be
+         ;   computed as 32 bit integers.
+         ;
+         ;           (Voff * Tp / Tcy) - (I1 * L / Tcy)
+         ;     Ton = ----------------------------------
+         ;                       Vin + Vd
+         ;
+         ;   Note that Tp/Tcy is the number of instruction cycles in a whole
+         ;   pulse, which is already known in the preprocessor constant PERCY.
+         ;
+         mov     voff, w0    ;get Voff
+         mov     #[v percy], w5 ;(Tp/Tcy) mult factor, leave PERCY in W5
+         mul.uu  w0, w5, w0  ;make first numerator term in W1:W0
+
+  /set r [/ l tcy]           ;mult factor for second numerator term
+  /set ii [rnd r]            ;integer mult factor to actually use
+         mov     i1, w2      ;get I1
+         mov     #[v ii], w3 ;(L/Tcy) mult factor
+         mul.uu  w2, w3, w2  ;make second numerator term in W3:W2
+
+         sub     w0, w2, w0  ;make final numerator in W1:W0
+         subb    w1, w3, w1
+
+         mov     vinmv, w2   ;get Vin
+         mov     vdmv, w3    ;get Vd
+         add     w2, w3, w2  ;Vin + Vd --> W2
+
+         repeat  #17
+         div.ud  w0, w2      ;make Ton in instuction cycles in W0
+         mov     w0, w4      ;save it in W4
+
+         sub     w5, w0, w5  ;make Td (discharge time) in inst cycles in W5
+         ;
+         ;   Register contents:
+         ;
+         ;     W0  -  Ton in instruction cycles.
+         ;
+         ;     W4  -  Ton in instruction cycles.
+         ;
+         ;     W5  -  Td in instruction cycles.
+         ;
+         ;   Compute the peak inductor current for this Ton.  The equation in
+         ;   our units is:
+         ;
+         ;               Von Ton Tcy
+         ;     Ip = I1 + -----------
+         ;                    L
+         ;
+  /set r [* maxvin 1000 percy] ;max possible Von*Ton
+  /set r2 [* [/ tcy l] 65536] ;Tcy/L mult factor for result in high word
+  /set sh [rnd [/ [log2 [/ r r2]] 2]] ;bits to shift Von*Ton right for best resolution
+  /set shm [exp 2 sh]        ;mult factor due to shifting
+  /set ii [rnd [* r2 shm]]   ;actual mult factor for result in high word
+
+         mov     von, w0     ;get Von
+         mul.uu  w0, w4, w0  ;Von * Ton --> W1:W0
+         shiftrl32l w1, w0, [v sh] ;shift numerator to scale into just W0
+         mov     #[v ii], w1 ;get mult factor for Tcy/L
+         mul.uu  w0, w1, w0  ;make second term of Ip in W1
+
+         mov     i1, w0      ;get I1
+         add     w0, w1, w0  ;make Ip in W0
+
+         cp      satma       ;compare saturation limit to computed Ip
+         bra     ltu, mode_discont ;min continuous results in too high current ?
+         ;
+         ;   The minimum continuous pulse does not saturate the inductor.
+         ;
+         ;   Register contents:
+         ;
+         ;     W0  -  Ip, mA.
+         ;
+         ;     W4  -  Ton, instruction cycles.
+         ;
+         ;     W5  -  Td, instruction cycles.
+         ;
+         ;   Compute the charge delivered by this minimum continuous mode pulse.
+         ;   This will be used to decide whether the pulse will be continuous
+         ;   or discontinuous.  The equation for the delivered charge, in MKS
+         ;   units, is:
+         ;
+         ;          (I1 + Ip) Ton + Ip * Td
+         ;     Qd = -----------------------
+         ;                     2
+         ;
+         ;   The equation in our units as will be computed is:
+         ;
+         ;          (I1 + Ip) Ton Tcy   Ip Td Tcy
+         ;     Qd = ----------------- + ---------
+         ;                2 Tp            2 Tp
+         ;
+  /set r [/ [* tcy 65536] [* 2 tp]] ;Tcy/2Tp mult factor for result in high word
+  /set r2 [* sat 1000 percy] ;max possible value to multiply by
+  /set sh [rnd [/ [log2 [/ r2 r]] 2]] ;bits to shift I*Ton right for best resolution
+  /set shm [exp 2 sh]        ;mult factor due to shifting
+  /set ii [rnd [* r shm]]    ;actual mult factor for result in high word
+
+         mov     w0, w3      ;save Ip in W3
+
+         add     i1, wreg    ;I1 + Ip --> W0
+         mul.uu  w0, w4, w0  ;(I1 + Ip) Ton --> W1:W0
+         shiftrl32l w1, w0, [v sh] ;shift result to fit in just W0
+         mov     #[v ii], w1 ;get mult factor for divide by the constants
+         mul.uu  w0, w1, w0  ;make result of first term in W1
+
+         mul.uu  w3, w5, w2  ;Ip * Td --> W3:W2
+         shiftrl32l w3, w2, [v sh] ;shift result to fit in just W2
+         mov     #[v ii], w3 ;get mult factor for divide by the constants
+         mul.uu  w2, w3, w2  ;make result of second term in W3
+
+         add     w1, w3, w0  ;make min continuous delivered charge in W0
+         cp      qp          ;compare desired charge to min continuous charge
+         bra     geu, mode_cont ;min continuous too small, go do continuous pulse
+
+;***************************************
+;
+;   Do a discontinous mode pulse.
+;
+;   We already know that the minimum pulse does not saturate the inductor and
+;   does not deliver enough charge, and that the minimum continuous mode pulse
+;   either saturates the inductor or delivers too much charge.
+;
+mode_discont:
+         ;
+         ;   The relationship between delivered charge and the inductor on time
+         ;   (Ton) is a quadratic:
+         ;
+         ;     A * Ton^2 + B * Ton + C = 0
+         ;
+         ;   Each term is a value of charge.  The units of Ton will be
+         ;   instruction cycles, since that is what will be loaded into the
+         ;   hardware directly.  Each instruction cycle is Tcy long, so Ton is
+         ;   in units of Tcy seconds.  Existing variables have values containing
+         ;   EMF in mV, current in mA, and charge in mA * TP.  Scale factors
+         ;   will be adjusted so that Ton is in the desired units.
+         ;
+         ;   Compute the quadratic A term.  With all the scaling for our units
+         ;   applied, the equation is:
+         ;
+         ;         (Von/Voff + 1) Von Tcy^2
+         ;     A = ------------------------
+         ;                2000 L
+         ;
+  /call shiftl_mult16u [+ [/ maxvin vd] 1] ;make shift amount for max (Von/Voff + 1)
+  /set sh2 sh                ;save it
+  /set r [/ [* tcy tcy] [* 2000 l]] ;Tcy^2 / 2000 L mult factor
+  /call shiftl_mult16u [v r] ;set SH to shift amount for mult factor in 16 bits
+
+  /write ""
+  /write "         ;   SH2 = " sh2 ", bits (Von/Voff + 1) shifted left"
+  /write "         ;   SH = " sh ", bits (Tcy^2 / 2000 L) shifted left"
+  /write "         ;"
+         mov     von, w0     ;get Von into W0
+         lsr     w0, #[- 16 sh2], w1 ;shift it left SH2 bits into W1:W0
+         sl      w0, #[v sh2], w0
+         mov     voff, w2    ;get Voff
+         repeat  #17
+         div.ud  w0, w2      ;make Von/Voff in W0
+         mov     #[shiftl 1 sh2], w2 ;add 1 (shifted left SH2 bits)
+         add     w0, w2, w0  ;(Von/Voff + 1) --> W0, left SH2 bits
+         mov     w0, w4      ;save for use in computing B term later
+
+         mov     von, w2     ;get Von
+         mov     #[v im], w3 ;get (Tcy^2 / 2000 L) mult factor, left SH bits
+         mul.uu  w2, w3, w2  ;(Von Tcy^2 / 2000 L) --> W3, left SH-16 bits
+
+         mul.uu  w0, w3, w0  ;make final 32 bit A coefficient in W1:W0
+         mov     #[- [+ sh2 sh] 16], w2 ;indicate bits value is shifted left
+         norm16u             ;normalize to signed 16 bits in W0
+         mov     w0, xa      ;save the A coefficient
+         mov     w2, xas
+         ;
+         ;   Compute the quadratic B term.  With all the scaling for our units
+         ;   applied, the equation is:
+         ;
+         ;         (Von/Voff + 1) I1 Tcy
+         ;     B = ---------------------
+         ;                1000
+         ;
+         ;   W4 already contains (Von/Voff + 1) shifted left SH2 bits.
+         ;
+  /set r [/ tcy 1000]        ;(Tcy / 1000) mult factor
+  /call shiftl_mult16u [v r] ;set SH to shift amount for mult factor in 16 bits
+
+  /write ""
+  /write "         ;   SH2 = " sh2 ", bits (Von/Voff + 1) shifted left"
+  /write "         ;   SH = " sh ", bits (Tcy / 1000) shifted left"
+  /write "         ;"
+         mov     i1, w0      ;get I1
+         mov     #[v im], w1 ;get mult factor
+         mul.uu  w0, w1, w0  ;(I1 Tcy / 1000) --> W1, left SH-16 bits
+
+         mul.uu  w1, w4, w0  ;make final 32 bit B coefficient in W1:W0
+         mov     #[- [+ sh2 sh] 16], w2 ;indicate bits value is shifted left
+         norm16u             ;normalize to signed 16 bits in W0
+         mov     w0, xb      ;save the B coefficient
+         mov     w2, xbs
+         ;
+         ;   Compute the quadratic C term.  With all the scaling for our units
+         ;   applied, the equation is:
+         ;
+         ;          I1^2 L     Qp Tp
+         ;     C = --------- - -----
+         ;         Voff 2000   1000
+         ;
+         mov     i1, w0      ;get I1
+         mul.uu  w0, w0, w0  ;square it into W1:W0
+         mov     #0, w2      ;indicate bits W1:W0 is shifted left
+         norm16u             ;maximize into 15 bits of W0
+         mov     w0, w1      ;expand result into W1:W0
+         mov     #0, w0
+         add     #16, w2     ;update shift count accordingly
+
+         mov     voff, w3    ;get Voff
+         ff1l    w3, w4      ;make bits to shift Voff left to fill word
+         sub     #1, w4
+         sl      w3, w4, w3  ;shift Voff left, high bit is now 1
+         repeat  #17
+         div.ud  w0, w3      ;make I1^2 / Voff in W0
+         sub     w2, w4, w2  ;update W0 shift count
+
+  /set r [/ l 2000]          ;(L / 2000) fixed mult factor
+  /call shiftl_mult16u [v r] ;find bits shift left
+  /set sh [- sh 1]           ;one less bit left for product to fit 32 bits signed
+  /set shm [exp 2.0 sh]      ;mult factor of the left shift
+  /set im [rnd [* r shm]]    ;make integer mult factor
+         mov     #[v im], w1 ;get (L / 2000) mult factor
+         mul.uu  w0, w1, w0  ;make complete first term in W1:W0
+         add     #[v sh], w2 ;update W1:W0 shift count
+
+  /set r [/ tp 1000]         ;(Tp / 1000) fixed mult factor
+  /call shiftl_mult16u [v r] ;find bits shift left
+         mov     qp, w4      ;get Qp
+         mov     #[v im], w5 ;(Tp / 1000) mult factor
+         mul.uu  w4, w5, w4  ;make complete second term in W5:W4
+         mov     #[v sh], w3 ;indicate number of bits W5:W4 shifted left
+
+         normab              ;normalize W1:W0 and W5:W4 to same shift count
+         sub     w0, w4, w0  ;subtract the two terms to make final C term
+         subb    w1, w5, w1
+         norm16s             ;normalize to signed 16 bits in W0
+         mov     w0, xc      ;save the C coefficient
+         mov     w2, xcs
+
+         solve_quadratic pulse_zero ;solve the quadratic, 0 pulse if no solution
+         mov     w0, ton     ;save computed switch on time in TON
+;
+;   TON has been set to the number of cycles the inductor should be on for
+;   according to the quadratic equation.
+;
+         make_ip             ;compute peak inductor current into IP and W0
+         cp      satma       ;compare max allowed current to computed peak
+         bra     ltu, pulse_max ;computed peak too high, do Ton to just saturate
+
+         mov     ton, w0     ;get the proposed on-time into W0
+         mov     #[v percy], w1 ;get maximum possible Ton
+         cp      w0, w1      ;compare computed time to the maximum time
+         bra     geu, tonfull ;on for the whole pulse time ?
+         ;
+         ;   Do the computed Ton.
+         ;
+         mov     #[v stretchcy], w1 ;get amount hardware will stretch the on-time
+         sub     w0, w1, w1  ;make hardware duty cycle to achieve Ton
+         mov     w1, Mdc     ;set the PWM duty cycle for the next pulse
+
+         clr     i2          ;discontinuous pulse, so ending current is always 0
+         mov     qp, w0      ;assume actual charge will be the desired amount
+         mov     w0, qnext
+         jump    pulse_done
+
+;***************************************
+;
+;   Do a continuous mode pulse.
+;
+;   We already know that the minumum continuous mode pulse does not saturate the
+;   inductor and does not deliver enough charge.
+;
+mode_cont:
+;
+;   The relationship between the delivered charge and the inductor on time (Ton)
+;   is a quadratic:
+;
+;     A * Ton^2 + B * Ton + C = 0
+;
+         ;
+         ;   Compute the quadratic A term.  In our units the equation is:
+         ;
+         ;         -(Vinmv + Vdmv) Tcy^2
+         ;     A = ---------------------
+         ;                2000 L
+         ;
+  /set r [/ [* tcy tcy] [* 2000 l]] ;Tcy^2 / 2000 L fixed mult factor
+  /call shiftl_mult16u [v r] ;find shift amount to fit into 16 bits
+  /set sh [- sh 1]           ;shift one less bit left due to signed number
+  /set shm [exp 2.0 sh]      ;mult factor respresented by SH
+  /set ii [rnd [* -1 r shm]] ;integer mult factor to actually use
+
+         mov     vinmv, w0
+         add     vdmv, wreg  ;Vinmv + Vdmv --> W0
+         mov     #[v ii], w1 ;(Tcy^ / 2000 L) mult factor
+         mul.ss  w0, w1, w0  ;make raw A value in W1:W0
+         mov     #[v sh], w2 ;indicate bits W1:W0 is shifted left
+
+         norm16s             ;maximally fit value into W0, shift count in W2
+         mov     w0, xa      ;save the quadratic A coefficient
+         mov     w2, xas
+         ;
+         ;   Compute the quadratic B term.  In our units, the equation is:
+         ;
+         ;         (Vinmv + Vdmv) Tp Tcy
+         ;     B = ---------------------
+         ;                1000 L
+         ;
+  /set r [/ [* tp tcy] [* 1000 l]] ;(Tp Tcy / 1000 L) fixed mult factor
+  /call shiftl_mult16u [v r] ;find shift amount to fit into 16 bits
+
+         mov     vinmv, w0
+         add     vdmv, wreg  ;Vinmv + Vdmv --> W0
+         mov     #[v im], w1 ;(Tp Tcy / 1000 L) mult factor
+         mul.uu  w0, w1, w0  ;make raw B value in W1:W0
+         mov     #[v sh], w2 ;indicate bits W1:W0 is shifted left
+
+         norm16u             ;maximally fit value into W0, shift count in W2
+         mov     w0, xb      ;save the quadratic B coefficient
+         mov     w2, xbs
+         ;
+         ;   Compute the quadratic C term.  In our units, the equation is:
+         ;
+         ;         I1 Tp   Voff Tp^2   Qp Tp
+         ;     C = ----- - --------- - -----
+         ;         1000     2000 L     1000
+         ;
+  /set r [/ tp 1000]         ;make mult factor for first and third terms
+  /call shiftl_mult16u [v r] ;find shift amount to fit into 16 bits
+  /set ii sh                 ;temp save it in II
+  /set r [/ [* tp tp] [* 2000 l]] ;mult factor for second term
+  /call shiftl_mult16u [v r] ;find shift amount to fit into 16 bits
+  /set sh [min ii sh]        ;shift value for largest term
+  /set sh [- sh 1]           ;shift one less bit to allow for negative
+  /set shm [exp 2.0 sh]      ;mult factor expressed by SH
+  /set r [/ tp 1000]         ;(Tp / 1000) fixed mult factor
+  /set ii [rnd [* r shm]]    ;integer mult factor to actually use
+         mov     i1, w2      ;get I1
+         mov     #[v ii], w3 ;(Tp / 1000) mult factor
+         mul.uu  w2, w3, w2  ;make first term in W3:W2
+
+  /set r [/ [* tp tp] [* 2000 l]] ;(Tp^2 / 2000 L) fixed mult factor
+  /set ii [rnd [* r shm]]    ;integer mult factor to actually use
+         mov     voff, w0    ;get Voff
+         mov     #[v ii], w1 ;(Tp^2 / 2000 L) mult factor
+         mul.uu  w0, w1, w0  ;make second term in W1:W0
+         sub     w2, w0, w2  ;combine first and second terms into W3:W2
+         subb    w3, w1, w3
+
+  /set r [/ tp 1000]         ;(Tp / 1000) fixed mult factor
+  /set ii [rnd [* r shm]]    ;integer mult factor to actually use
+         mov     qp, w0      ;get Qp
+         mov     #[v ii], w1 ;(Tp / 1000) mult factor
+         mul.uu  w0, w1, w0  ;make third term in W1:W0
+         sub     w2, w0, w0  ;combine with first and second terms into W1:W0
+         subb    w3, w1, w1
+
+         mov     #[v sh], w2 ;indicate bits W1:W0 value is shifted left
+         norm16s             ;normalize to signed 16 bits in W0
+         mov     w0, xc      ;save the C coefficient
+         mov     w2, xcs
+
+         solve_quadratic pulse_max ;solve the quadratic, max pulse if no solution
+;
+;   W0 contains the number of cycles the switch should be on for next pulse to
+;   transfer the desired charge to the output.
+;
+         cp      tpcy        ;compare full period to computed Ton
+         bra     ltu, pulse_max ;computed pulse too long, do max possible pulse
+
+         mov     w0, ton     ;save computed pulse time in TON
+         make_ip             ;compute peak inductor current into IP and W0
+         cp      satma       ;compare max allowed current to computed peak
+         bra     ltu, pulse_max ;computed peak too high, do Ton to just saturate
+         ;
+         ;   Do the computed Ton.
+         ;
+         mov     #[v stretchcy], w0 ;get amount hardware will stretch the on-time
+         sub     ton, wreg   ;make hardware duty cycle value
+         mov     w0, Mdc     ;set the PWM duty cycle for the next pulse
+         ;
+         ;   Set TD, the inductor discharge time.  Since this is a continuous
+         ;   pulse, that is just, in our units:
+         ;
+         ;     TD = PERCY - TON
+         ;
+         mov     #[v percy], w0 ;get cycles in full period
+         subr    ton, wreg   ;make inductor discharge time in cycles
+         mov     w0, td      ;save it
+         ;
+         ;   Set I2, which is the current in the inductor at the end of the
+         ;   period.
+         ;
+         make_i2             ;compute inductor ending current into I2 and W0
+         ;
+         ;   set QNEXT, which is the total charge that will be delivered.  If we
+         ;   are still here, that means the computed desired inductor on time
+         ;   didn't exceed the pulse period or resulted in saturating the
+         ;   inductor.  This means the desired charge will be delivered, so that
+         ;   value is simply copied.
+         ;
+         mov     qp, w0      ;assume actual charge will be the desired amount
+         mov     w0, qnext
+         jump    pulse_done
+
+;***************************************
+;
+;   Do the maximum possible pulse.  This will either result in Ton that just
+;   saturates the inductor, or Ton for the full pulse time.
+;
+pulse_max:
+         mov     i1, w0
+         cp      satma       ;compare saturation limit to the starting current
+         bra     leu, pulse_zero ;already at or above saturation, do zero-length pulse ?
+;
+;   Find Ton so that the peak current is the saturation current of the inductor.
+;   In our units;
+;
+;           (Isat - I1) L
+;     Ton = -------------
+;              Von Tcy
+;
+;   W0 contains I1.
+;
+  /call shiftl_mult16u [/ l tcy] ;make mult factor for best scaled resolution
+
+         sub     satma, wreg ;make (Isat - I1) in W0
+
+         mov     #[v im], w1 ;get mult factor
+         mul.uu  w0, w1, w0  ;make (Isat - I1) L / Tcy in W1:W0, SH fraction bits
+         shiftrl32 w1, w0, w2, [v sh] ;shift off the fraction bits
+
+         mov     von, w2     ;get denominator
+         lsr     w2, #1, w3  ;add 1/2 denominator for rounding
+         add     w0, w3, w0
+         addc    #0, w1
+         repeat  #17
+         div.ud  w0, w2      ;divide by Von to make Ton in W0
+         bra     ov, tonfull ;Ton too large for representation, do a full on pulse ?
+
+         mov     #[v percy], w1 ;get maximum possible Ton
+         cp      w0, w1      ;compare computed time to the maximum time
+         bra     geu, tonfull ;on for the whole pulse time ?
+         sub     w1, w0, w4  ;save max possible Td in W4 for later
+
+         mov     #[v mintoncy], w1 ;get minimum allowed pulse time
+         cp      w0, w1
+         bra     ltu, pulse_zero ;Ton too short, do zero-length pulse instead ?
+
+         mov     #[v stretchcy], w1 ;get amount hardware will stretch the on-time
+         sub     w0, w1, w1  ;make hardware duty cycle to achieve Ton
+         mov     w1, Mdc     ;set the PWM duty cycle for the next pulse
+         mov     w0, ton     ;save actual switch on time
+
+         mov     satma, w1   ;the peak current is the saturation current
+         mov     w1, ip
+         make_td             ;compute discharge time into Td and W0
+         cp      w0, w4      ;compare computed Td to max available Td
+         bra     ltu, max_disc ;pulse is discontinuous ?
+         mov     w4, td      ;discharge time is all remaining pulse time
+         ;
+         ;   The pulse is in continuous mode.  This means the inductor current
+         ;   does not reach 0 before the end of the pulse time.  Ip, Ton, and Td
+         ;   have been set.
+         ;
+         make_i2             ;compute inductor ending current in I2 and W0
+         make_qnext          ;compute total charge that will be deliverd in QNEXT
+         goto    pulse_done
+;
+;   The maximum pulse will be discontinuous.  The following values have already
+;   been set:
+;
+;     Ton  -  Final switch on time, instruction cycles.  The hardware duty cycle
+;             has also been derived from this and set.
+;
+;     Ip  -  Peak inductor current, mA.
+;
+;     Td  -  Inductor discharge time, instruction cycles.
+;
+;   Ton + Td is known to be less than the full pulse time.
+;
+max_disc:
+         clr     i2          ;ending inductor current will be 0
+         make_qnext          ;compute charge that will be delivered into QNEXT
+         goto    pulse_done
+
+;***************************************
+;
+;   Do a pulse where the switch is on the whole time.  It must already be known
+;   the the inductor will not saturate.  If not sure, go to PULSE_MAX instead.
+;
+tonfull:
+         mov     #[v percy], w1 ;get the pulse on time
+         mov     w1, Mdc     ;set the PWM duty cycle for the next pulse
+         mov     w1, ton     ;save actual switch on time
+
+         make_ip             ;compute peak inductor current in W0
+         mov     w0, i2      ;ending current will be the peak current
+         ;
+         ;   Find the actual charge that will be delivered next pulse.  Since
+         ;   the switch will be on for the whole pulse, the inductor dicharge
+         ;   time will be 0.  The delivered charge therefore in our units is:
+         ;
+         ;             (I1 + Ip)
+         ;     Qnext = ---------
+         ;                 2
+         ;
+         ;   W0 contains Ip.
+         ;
+         add     i1, wreg    ;make I1 + Ip
+         add     #1, w0      ;add 1/2 for rounding
+         lsr     w0, #1, w0  ;make Qnext in W0
+         mov     w0, qnext   ;save it
+         jump    pulse_done
+
+;***************************************
+;
+;   Do a zero-length pulse.
+;
+pulse_zero:                  ;do a zero-length pulse
+         clr     Mdc         ;set the on-time to zero
+         clr     ton
+         ;
+         ;   Compute the amount the inductor current will decrease during the
+         ;   pulse, assuming the discharge time is the whole pulse time.  In our
+         ;   units:
+         ;
+         ;          Voff Tp
+         ;     Id = -------
+         ;             L
+         ;
+  /set r [/ tp l]            ;mult factor
+  /set ii [rnd [* r 65536]]  ;actual mult factor for result in high word
+
+         mov     voff, w0    ;get voltage accross inductor during discharge
+         mov     #[v ii], w1
+         mul.uu  w0, w1, w0  ;make Id in W1
+
+         mov     i1, w0      ;get inductor starting current
+         cp      w0, w1      ;compare starting current to current decrease
+         bra     ltu, zero_disc ;inductor current ends before end of pulse ?
+         ;
+         ;   Continuous mode.  The inductor does not discharge before the pulse
+         ;   ends.  W0 contains the starting current (I1) and W1 contains the
+         ;   amount the current will decrease during the pulse.
+         ;
+         sub     w0, w1, w2  ;make ending current in W2
+         mov     w2, i2      ;save it
+         ;
+         ;   Compute the delivered charge.  In our units:
+         ;
+         ;             I1 + I2
+         ;     Qnext = -------
+         ;                2
+         ;
+         ;   W0 contains I1, W2 contains I2.
+         ;
+         add     w0, w2, w0  ;I1 + I2 --> W0
+         add     #1, w0      ;add 1/2 for rounding
+         lsr     w0, #1, w0  ;make Qnext in W0
+         mov     w0, qnext   ;save it
+         jump    pulse_done
+;
+;   Doing a zero-legnth pulse, which will be discontinous.  W0 contains the
+;   inductor starting current (I1).
+;
+zero_disc:
+         clr     i2          ;inductor ending current will be 0
+         mov     w0, ip      ;the starting current is the peak current
+         make_td             ;compute discharge time in TD and W0
+         ;
+         ;   W0 contains Td.
+         ;
+         ;   Compute the charge that will be delivered.  In our units:
+         ;
+         ;             I1 Td Tcy
+         ;     Qnext = ---------
+         ;                2 Tp
+         ;
+  /set r [/ tcy [* 2.0 tp]]  ;mult factor for the constant part
+  /call shiftl_mult16u [v r] ;make shift factor for maximum resolution
+  /set sh [- sh 16]          ;make fraction bits that will be in high word
+
+         mov     i1, w2
+         mov     #[v im], w3
+         mul.uu  w2, w3, w2  ;make I1 Tcy / (2 Tp) in W3, SH fraction bits
+         mul.uu  w3, w0, w0  ;make result in W1:W0, SH fraction bits
+         add_half32 w1, w0, w2, [v sh] ;add 1/2 for rounding
+         shiftrl32l w1, w0, [v sh] ;shift right to make final value in W0
+         mov     w0, qnext   ;save it
+         jump    pulse_done
+;
+;   The hardware has been set up for the next pulse and the values have been
+;   computed that characterize this next pulse.  In particular, I2 and QNEXT
+;   are set.
+;
+pulse_done:
+;
+;   Save a trace sample if this is enabled.
+;
+
+  /if [> ntrace 0] then
+         gcall   trace_sample ;grab another trace sample
+         mov     ton, w0     ;get inductor on time, cycles
+         cp0     w0
+         bra     z, dtrace
+         gcall   trace_trigger
+dtrace:                      ;done logging trace data
+    /endif
+;
+;   Update the persistant state to be ready for the next interrupt.
+;
+         mov     qthis, w0   ;advance the delivered charges
+         mov     w0, qlast
+         mov     qnext, w0
+         mov     w0, qthis
+
+         mov     vlast, w0   ;advance the measured voltage
+         mov     w0, vprev
+
+  /set ii [rnd [* i2pass 65536]] ;mult factor for result in high word
+  /if [>= ii 65536]
+    /then                    ;not derating inductor current at all
+         mov     i2, w0      ;copy the computed value directly
+         mov     w0, i1
+    /else
+         mov     i2, w0      ;get the computed inductor ending current
+         mov     #[v ii], w1 ;get the mult factor
+         mul.uu  w0, w1, w0  ;scale the inductor current by I2PASS into W1
+         mov     w1, i1      ;set starting inductor current for next computation
+    /endif
+;
+;   Restore state and exit the interrupt.
+;
+pulse_ret:                   ;debug code may jump here to return from interrupt
+         mov     save_w4, w4 ;restore trashed registers
+         mov     save_w5, w5
+         mov     save_w6, w6
+         mov     save_w7, w7
+         pop.s               ;restore W0-W3 and the saved status bits
+  /if debug_showintr then
+         bclr    sync_lat, #sync_bit ;indicate end of interrupt
+    /endif
+         retfie              ;return from A/D interrupt
+  /endblock                  ;end of context for temporary preprocessor variables
+
+.end

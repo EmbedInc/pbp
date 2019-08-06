@@ -1,0 +1,66 @@
+;   ***************************************************************
+;   * Copyright (C) 2015, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   Perform system-level initialization.  The individual modules have
+;   already been initialized.
+;
+/include "pbptest.ins.dspic"
+
+;*******************************************************************************
+;
+;   Configuration constants.
+;
+
+;
+;   Derived constants.
+;
+
+
+;*******************************************************************************
+;
+;   Variables.
+;
+;*******************
+;
+;   Global state.
+;
+
+;
+;*******************
+;
+;   Local state.
+;
+
+
+.section .init_code, code
+;*******************************************************************************
+;
+;   Routine INIT
+;
+;   This routine is jumped to from the STRT module after the individual
+;   modules have been initialized.
+;
+         glbent  init
+
+         mov     #250, w0    ;wait a while for hardware to stabalize
+         gcall   waitms
+
+         gcall   pulse_start ;start power supply processing
+         gcall   cmd_start   ;start the command processing task
+
+         gjump   main        ;run main event handling task
+
+.end

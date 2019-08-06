@@ -1,0 +1,156 @@
+;   ***************************************************************
+;   * Copyright (C) 2015, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   Include file used by all the modules that are private to this application.
+;
+;   This firmware runs the buck switcher on the Embed pulse-by-pulse
+;   computation demonstrator board.  See the PULSE module for details of the
+;   algorithm.
+;
+;   Hardware peripheral usage:
+;
+;     Timer 1  -  Used in CLOCK module to generate the periodic clock tick
+;       interrupt.  The global clock counters are derived from this interrupt.
+;
+;     Timer 5  -  Triggers A/D conversions.  Managed in the PULSE module.
+;
+;     AD  -  Digitizes the measured values for computing the length of each new
+;       pulse.  Managed in the PULSE module.
+;
+;     Motor control PWM  -  Generates the pulses that turn the power supply
+;       switch on and off.
+;
+;     UART1  -  Receives the host command stream, sends the host response
+;       stream.  Managed in the UART module.
+;
+
+;
+;   Debug switches.  All these should be set to FALSE for normal operation.
+;
+/const   debug_icd bool = false ;build for debugging with in-circuit debugger
+/const   debug_icdram bool = true ;for ICD debugging, but without extra NOPs, etc
+/const   debug   bool = false ;build for any debugging, not necessarily RealIce
+/const   debug_showintr bool = false ;SYNC ouput high during interrupt
+/const   debug_break bool = true ;enable code for software-controlled breakpoints
+
+/include "pbptestlib.ins.dspic"
+/include "pbptest_cmdrsp.ins.dspic"
+/include "(cog)src/dspic/trace_setup.ins.dspic"
+
+;*******************************************************************************
+;
+;   Application configuration parameters
+;
+/const   voutdef real = 3.3  ;default output voltage
+;
+;   Priority levels for each of the interrupts.
+;
+.equiv   ipr_clock, 1        ;periodic clock timer interrupt priority
+.equiv   ipr_uart_recv, 1    ;UART receive interrupt priority
+.equiv   ipr_uart_xmit, 1    ;UART transmit interrupt priority
+.equiv   ipr_ad, 6           ;A/D readings done, compute next pulse
+;
+;   Software error IDs.
+;
+.equiv   err_traposc, 1      ;oscillator failure trap
+.equiv   err_trapadr, 2      ;address error trap
+.equiv   err_hard, 3         ;hard error trap
+.equiv   err_trapstk, 4      ;stack error trap
+.equiv   err_trapmat, 5      ;math error trap
+.equiv   err_dmac, 6         ;DMAC error trap
+.equiv   err_soft, 7         ;soft trap error
+
+.equiv   err_notask, 8       ;task table overflow on attempt to create new task
+.equiv   err_uarthwov, 9     ;UART receive hardware overrun
+.equiv   err_uartswov, 10    ;UART receive software FIFO overrun
+;
+;   The registers listed in TSKSAVE are saved accross task swaps (calls
+;   to TASK_YIELD).
+;
+.set     ii,     regf0 | regf1 | regf2 | regf3
+.set     ii,     ii | regf4 | regf5 | regf6 | regf7
+.set     ii,     ii | regf8 | regf9 | regf10 | regf11
+.set     ii,     ii | regf12 | regf13 | regf14
+.equiv   tsksave, ii         ;mask of registers preserved by TASK_YIELD
+
+.equiv   tsknsave, (~tsksave) & 0x7FFF ;mask of registers trashed by TASK_YIELD
+;
+;   Derived constants.
+;
+
+
+;*******************************************************************************
+;
+;   Global flags.
+;
+;   All flags are initialized to 0 in the STRT module.
+;
+/flag    vhigh               ;voltage has been high since setpoint changed
+/flag    vlow                ;voltage has been low since setpoint changed
+/flag    dbgbreak            ;execute breakpoint code
+
+;*******************************************************************************
+;
+;   I/O pin declarations.
+;
+/inbit   an0     porta 0     ;extra analog input
+/inbit   vin     porta 1     ;input voltage analog input
+
+/inbit   vout    portb 0     ;output voltage analog input
+/inbit   vref    portb 1     ;2.5 V external reference
+/outbit  pgc     portb 2     ;programming clock line
+/outbit  pgd     portb 3     ;programming data line
+/inbit   rx      portb 4     ;UART input, RP36
+/outbit  tx      portb 5     ;UART output, RP37
+/outbit  contmode portb 6    ;in continuous mode, lights ContMode LED
+/outbit  climcy  portb 7     ;current limit this cycle, to CurrLim test point
+/outbit  climled portb 8     ;recent current limit, lights CurrLim LED
+/outbit  sync    portb 9     ;drives SYNC test point
+/outbit  load1   portb 10    ;turns on output load 1
+/outbit  load2   portb 11    ;turns on output load 2
+/outbit  recton  portb 12    ;turns on synchronous rectifier, PWM2H
+/outbit  rb13    portb 13    ;test point RB13, PWM2L
+/outbit  swon    portb 14    ;turns on main switch, PWM1H
+/outbit  swoff   portb 15    ;forces off main switch, PWM1L
+
+;*******************************************************************************
+;
+;   Macro INDICATE_ERROR id
+;
+;   Provide an external indication that a fatal error has occurred.  This macro
+;   is required by the standard TRAP module.
+;
+.macro indicate_error id
+  .endm
+
+;*******************************************************************************
+;
+;   Macro SWERR id
+;
+;   Indicate a fatal error has occurred.  The argument is the ID for the
+;   error.  When debugging, this will jump to SW_ERROR in the TRAP module
+;   with the ID in W0.  When this firmware is built for production mode,
+;   the ID is ignored and the processor is reset and restarted.
+;
+.macro swerr id
+
+  .if debug
+         mov     #\id, w0
+         gjump   sw_error
+    .else
+         reset
+    .endif
+  .endm

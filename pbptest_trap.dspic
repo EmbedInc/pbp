@@ -1,0 +1,129 @@
+;   ***************************************************************
+;   * Copyright (C) 2015, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   Trap handlers.  None of the traps are actually used.
+;
+/include "pbptest.ins.dspic"
+
+;*******************************************************************************
+;
+;   Configuration constants.
+;
+
+;
+;   Derived constants.
+;
+
+
+;*******************************************************************************
+;
+;   Variables.
+;
+;*******************
+;
+;   Global state.
+;
+
+;
+;*******************
+;
+;   Local state.
+;
+
+
+.section .trap_code, code
+;*******************************************************************************
+;
+;   Subroutine TRAP_INIT
+;
+         glbsub  trap_init
+
+         leaverest
+
+;*******************************************************************************
+;
+;   Oscillator failure trap.
+;
+         glbent  __OscillatorFail
+
+         indicate_error
+1:
+         nop
+         nop
+         nop
+         bra     1b
+
+;*******************************************************************************
+;
+;   Address error trap.
+;
+         glbent  __AddressError
+
+         indicate_error
+1:
+         nop
+         nop
+         nop
+         bra     1b
+
+;*******************************************************************************
+;
+;   Stack error trap.
+;
+         glbent  __StackError
+
+         indicate_error
+1:
+         nop
+         nop
+         nop
+         bra     1b
+
+;*******************************************************************************
+;
+;   Math error trap.
+;
+         glbent  __MathError
+
+         indicate_error
+1:
+         nop
+         nop
+         nop
+         bra     1b
+
+;*******************************************************************************
+;
+;   Error detected in software.  Interrupts are disabled and error is
+;   indicated.  This routine is for use during debugging.  It is
+;   intended to be jumped to from the SWERR macro defined in the project
+;   include file.  This macro only jumps here if the project is built in
+;   debug mode.  Otherwise the SWERR causes a hardware reset.  Therefore
+;   this routine only exists in debug builds.
+;
+.if debug
+         glbent  sw_error
+
+         mov     #0xFFFF, w1 ;disable all interrupts
+         mov     w1, Sr
+         indicate_error
+1:
+         nop
+         nop
+         nop
+         bra     1b
+  .endif
+.end

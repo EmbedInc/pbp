@@ -1,0 +1,316 @@
+;   ***************************************************************
+;   * Copyright (C) 2010, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   Command stream processor.  The module contains the mechanics for processing
+;   and responding to commands.  It also contains the commands dispatch table.
+;   Most actual commands are in other modules.
+;
+;   Exported routines are:
+;
+;     CMD_INIT
+;
+;       Performs module initialization.  This routine must be called before
+;       any other routine in this module.
+;
+;     CMD_START
+;
+;       Starts command processing.  A separate task is created that reads and
+;       processes the command stream in a infinite loop.
+;
+;     CMD_GET_CHECK
+;
+;       Checks for command stream byte immediately available.  Z cleared if a
+;       byte is available, set if not.
+;
+;     CMD_GET8  -  Get 8 bit unsigned value into W0.
+;     CMD_GET8S  -  Get 8 bit signed value into W0.
+;     CMD_GET16  -  Get 16 bit value into W0.
+;     CMD_GET24U  -  Get 24 bit unsigned value into W1:W0.
+;     CMD_GET24S  -  Get 24 bit signed value into W1:W0.
+;     CMD_GET32  -  Get 32 bit value into W1:W0.
+;
+;       Routines to read data from the command stream.  These routines are used
+;       by routines that implement commands.
+;
+;     CMD_LOCK_OUT
+;
+;       Acquire the exclusive lock on the response stream.  A task is only
+;       allowed to write to the response stream when holding this lock.
+;
+;     CMD_UNLOCK_OUT
+;
+;       Release the lock on the response stream.  This undoes what CMD_LOCK_OUT
+;       does.  The lock is automatically released when a command routine returns
+;       or jumps to CMD_DONE.
+;
+;     CMD_PUT8  -  Write the 8 low bits of W0.
+;     CMD_PUT16  -  Write the 16 bits of W0.
+;     CMD_PUT24  -  Write the 24 low bits of W1:W0.
+;     CMD_PUT32  -  Write the 32 bits of W1:W0.
+;
+;       Routines for writing data to the response stream.  Tasks are only
+;       allowed to write to the response stream when they hold the response
+;       stream sending lock.
+;
+;     CMD_DONE
+;
+;       Entry point that command routines must end up at when done.  The stack
+;       is reset to empty at CMD_DONE, so it is permissable to call this entry
+;       point like a subroutine, and to leave data on the stack.  The response
+;       stream sending lock is also released if it is held.
+;
+;       The address of CMD_DONE is written to the stack before a command routine
+;       is run, such that a RETURN from the top level of the command routine
+;       automatically jumps to CMD_DONE.  In other words, command routines can
+;       implemented as subroutines that return when done, as apposed to
+;       explicitly jumping to CMD_DONE.
+;
+;     CMD_PUTBUF
+;
+;       Write the low 8 bits of W0 as the next byte into the commands scratch
+;       buffer.  Nothing is done if the buffer is already full.  NCMDBUF is
+;       udpated as appropriate to contain the total number of bytes in the
+;       buffer.
+;
+;       The commands scratch buffer is automatically reset to empty before each
+;       command routine is run.  This buffer may only be used by the command
+;       processing routines.
+;
+;       This routine does not exist when BUFSIZE (see below) is 0.
+;
+;     CMD_PUTBUFN
+;
+;       Get the next N bytes from the command stream and save them into the
+;       commands scratch buffer.  N is passed in W0.
+;
+;       N bytes are always read from the command stream.  However, bytes are not
+;       saved after the buffer is full.
+;
+;       This routine does not exist when BUFSIZE (see below) is 0.
+;
+;   Other exported symbols are:
+;
+;     NCMDBUF
+;
+;       The number of bytes currently in the commands scratch buffer.  The
+;       buffer is reset to empty before each command routine is run.  This
+;       symbol is NCMDBUF_name when NAME exists and is not the empty string.
+;
+;       This symbol does not exist when BUFSIZE (see below) is 0.
+;
+;     CMDBUF
+;
+;       The start of the commands scratch buffer.  This symbol is CMDBUF_name
+;       when NAME exists and is not the empty string.
+;
+;       This symbol does not exist when BUFSIZE (see below) is 0.
+;
+;   The following preprocessor constants are used to configure this module:
+;
+;     NAME, string
+;
+;       Unique name added to CMD_xxx symbols exported and used by this module.
+;       Customizing the symbol names is necessary when multiple command
+;       processors exist in a system, handling command streams from different
+;       sources.
+;
+;       The generic names of symbols exported and required by this module are
+;       CMD_xxxx.  When NAME exists and is not the empty string, these names
+;       will be CMD_<name>_xxxx.  For example, the subroutine CMD_INIT becomes
+;       CMD_XYZ_INIT when NAME is set to "XYZ".
+;
+;       The default is the empty string, meaning the generic symbol names are
+;       used.
+;
+;     UART_NAME, string
+;
+;       The unique name of the UART routines to use.  If a system has multiple
+;       UARTs, then they must be uniquely named, using the same mechanism as the
+;       NAME constant for this module (above).  UART_NAME specifies the
+;       particular UART routines to call for sending and receiving the command
+;       and response streams.
+;
+;       The default is the NAME value, above.
+;
+;     BUFZIZE, integer
+;
+;       The size of the commands scratch buffer, in bytes.  This buffer is for
+;       the exclusive use of command processing routines.  When this value is 0,
+;       then no buffer is created, and the routines to access the buffer are not
+;       created.
+;
+;       The default is 0.
+;
+;     SENDNNOP, integer
+;
+;       The number of NOP responses to send at startup.  A NOP response is a
+;       single byte that is supposed to be ignored by hosts.  Therefore, sending
+;       as many NOPs as the maximum number of bytes in any command guarantees
+;       that the host will interpret the next byte as a reponse opcode.  Setting
+;       this value to zero completely removes the code that sends NOPs at
+;       startup.
+;
+;       The default is 16.
+;
+;     DRAINWAIT, real
+;
+;       Seconds no byte is received to consider the command stream drained.
+;       When the command stream processing task is started, it gets and discards
+;       any existing recieved bytes.  It keeps getting and discarding received
+;       bytes until no byte is received for DRAINWAIT seconds.  When DRAINWAIT
+;       is not defined, then the logic to drain the command stream on startup is
+;       removed.
+;
+;     CMDDONE_SET, string
+;
+;       Name of the system flag to set whenever the processing of a command is
+;       completed.
+;
+;     CMDDONE_CLR, string
+;
+;       Name of the system flag to clear whenever the processing of a command is
+;       completed.
+;
+;     DEBUG_CMDDEL, bool
+;
+;       When TRUE, causes the dispatch routine to wait a little while after
+;       receiving each command opcode, before jumping to the command routine.
+;       The purpose is so that any command parameter bytes are in the input
+;       buffer when the command routine is run.  This simplifies single-step
+;       debugging since the command stream communication is not disrupted by the
+;       slow execution, and routines that get command parameters complete
+;       immediately.
+;
+;     CMD_name, string
+;
+;       There must be one of these constants for each implemented command.  The
+;       constant value is:
+;
+;         n [routine]
+;
+;       N is the 0-255 command opcode value.  The optional ROUTINE parameter is
+;       the name of the command routine.  This is the routine that is run to
+;       process the command.  The default for ROUTINE is "cm_<name>", where NAME
+;       is taken from the CMD_ constant name.
+;
+;       For example, if constant "cmd_blork" is set to "5", then command opcode
+;       5 will cause routine "cm_blork" to be run to read the remaining command
+;       bytes and perform the command.  If "cmd_blork" is set to "5 send_blork",
+;       then opcode 5 will cause routine "send_blork" to be run to process the
+;       command.
+;
+;       The names of these constants are customized according to the NAME
+;       constant, described above.  For example, if NAME is set to "abc", then
+;       the constant "cmd_abc_blork" specifies the opcode and routine name for
+;       the BLORK command.  The default command routine is likewise customized
+;       according to NAME.  With NAME "abc" and CMD_ABC_BLORK "5", the routine
+;       for command 5 is "cm_abc_blork".  Routine names explicitly set by using
+;       the ROUTINE parameter in the constant value are not customized by NAME.
+;
+;       None of these constants are created by default.  For a command to exist,
+;       a constant with its opcode value must be explicitly created.  Some
+;       "library" code that implements common commands searches the CMD_xxx
+;       constants to decide whether specific command routines should be created.
+;
+;   Additional preprocessor symbols used to customize this module are:
+;
+;     macro GETBYTE
+;
+;       Get the next command stream byte into W0.  The default is to call
+;       UART_PUT, as customized by UART_NAME.
+;
+;     macro LOCK
+;
+;       Acquire the exclusive lock on the response stream.  The default is to
+;       call UART_LOCK, as customized by UART_NAME.
+;
+;     macro UNLOCK
+;
+;       Release the lock on the response stream.  The default is to call
+;       UART_UNLOCK, as customized by UART_NAME.
+;
+;     macro PUTBYTE
+;
+;       Send the byte in the low 8 bits of W0 to the response stream.  The
+;       default is to call UART_PUT, as customized by UART_NAME.
+;
+/include "pbptest.ins.dspic"
+
+;*******************************************************************************
+;
+;   Configuration constants.
+;
+/const   name    = ""        ;unique name to add to CMD_xxx symbols
+/const   uart_name = name    ;unique name to add to UART_xxx symbols
+/const   bufsize integer = 32 ;size of commands scratch buffer, bytes
+/const   sendnnop integer = 16 ;number of NOP responses to send at startup
+/const   drainwait real = 0.010 ;seconds no received byte for CMD stream drained
+/const   cmddone_set = ""    ;flag to set when done processing a command
+/const   cmddone_clr = ""    ;flag to clear when done processing a command
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro GETCHECK
+//
+//   Check for whether a command stream byte is immediately available.  The Z
+//   flag is cleared if a byte is available, and set otherwise.
+//
+//macro getcheck
+//  endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro GETBYTE
+//
+//   Get the next command stream byte into W0.  W0 will be 0 to 255.  This macro
+//   waits indefinitely until a command stream byte is available.  All other
+//   registers are preserved.
+//
+//macro getbyte
+//  endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro LOCK
+//
+//   Acquire the exclusive lock on the response stream.  This macro waits
+//   indefinitely until the lock is available.  All registers are preserved.
+//
+//macro lock
+//  endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro UNLOCK
+//
+//   Release the response stream lock.  All registers are preserved.
+//
+//macro unlock
+//  endmac
+
+////////////////////////////////////////////////////////////////////////////////
+//
+//   Macro PUTBYTE
+//
+//   Write the byte in the low 8 bits of W0 to the response stream.  All
+//   registers are preserved.
+//
+//macro putbyte
+//  endmac
+
+/include "(cog)src/dspic/cmd.ins.dspic"
+
+.end

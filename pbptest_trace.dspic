@@ -1,0 +1,143 @@
+;   ***************************************************************
+;   * Copyright (C) 2015, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   This module implements a signal tracing capability.  A snapshot of a set of
+;   RAM words is periodically taken and written to a circular buffer.  When the
+;   buffer is full, the oldest values are overwitten by new values in a circular
+;   fashion.
+;
+;   A trigger event can be declared, which causes new data to be ignored once
+;   the specified amount of data past the trigger event is logged.  The whole
+;   logged trace data can then be sent to the host.  The trigger can be
+;   configured to occur anywhere within the logged data.
+;
+;   The application interface to this trace facility includes:
+;
+;     TRACE_INIT
+;
+;       Subroutine that must be called once to initialize this module before any
+;       other calls into the module.
+;
+;     TRACE_NWORDS
+;
+;       Subroutine that sets the number of 16 bit words in each data sample.
+;       The number is passed in W0.  The trace state is reset: untriggered, data
+;       pointers invalid, default trigger position.
+;
+;     TRACE_WORDCFG
+;
+;       Subroutine that configures one 16 bit data word within the trace
+;       samples.  W0 contains the 0-N number of the word within the sample.  W1
+;       contains the address of the variable to read to get the data for this
+;       word.  W1 can be 0, in which case nothing is read and the data value
+;       will always be 0.  W1 must point to a whole word, which means the low
+;       bit must be 0.
+;
+;     TRACE_TRIGPOS
+;
+;       Susbroutine that sets the trigger position within the trace buffer.  W0
+;       contains 0-65535, which maps linearly from the start to the end of the
+;       buffer.  Any current trigger condition is reset.
+;
+;     TRACE_TRIGRESET
+;
+;       Subroutine that resets any trigger condition.  The state will be
+;       untriggered.
+;
+;     TRACE_TRIGGER
+;
+;       Subroutine to indicate that the last saved sample corresponds to the
+;       trigger event.  Ignored if already triggered.
+;
+;     TRACE_SAMPLE
+;
+;       Subroutine to collect and save one data sample.  Ignored if buffer full
+;       after trigger or sampling is temporarily suspended.
+;
+;     TRACE_SEND
+;
+;       Subroutine that sends the captured data trace to the host.  The format
+;       of the TRACE response is:
+;
+;         TRACE nsamp wordsps trigofs word...word
+;
+;           NSAMP - Number of samples that will be sent, 16 bit unsigned.
+;
+;           WORDSPS  -  Words per sample, 8 bit unsigned.
+;
+;           TRIGOFS  -  Offset of trigger within the samples, 16 bit unsigned.
+;             0 is for the first sample, 1 for the second, etc.  TRIGOFS = NSAMP
+;             means trigger not occurred yet.
+;
+;           WORD...WORD  -  The data words, 16 bits each.  There will be exactly
+;             NSAMP*WORDSPS words.
+;
+;       This subroutine can be called whether data sampling is currently enabled
+;       or not.  Data sampling will be temporarily disabled while the data is
+;       sent.  This guarantees the sent data will be a consistant snapshot,
+;       although data samples that occurred during this call will be lost.
+;
+;     FLAG_TRACEARM
+;
+;       Global flag that must be set by the application to make the next trigger
+;       valid.  Trigger events are ignored when this flag is clear.  A valid
+;       trigger event automatically clears this flag.
+;
+;     FLAG_TRACEFULL
+;
+;       Global flag that indicates that a trigger has occurred and that all
+;       samples following the trigger have been collected.  This flag together
+;       with FLAG_TRACEUSED can be used by the application to call TRACE_SEND.
+;
+;     FLAG_TRACESENT
+;
+;       Global flag that is set by subroutine TRACE_SEND if it is called when
+;       the trace was full.  This is to indicate that the current trace data has
+;       already been sent.  Application foreground code might, for example, call
+;       TRACE_SEND whenever FLAG_TRACEFULL is set but FLAG_TRACESENT is not set.
+;
+;   The following resources must be provided by the application:
+;
+;     TRACE_SETUP.INS.DSPIC  -  This file must be included by the project
+;       include file.
+;
+;     RSP_TRACE  -  Assembler symbolic constant for the TRACE host response
+;       opcode for sending trace data.
+;
+;     CMD_LOCK_OUT  -  Subroutine to acquire the exclusive lock on sending to
+;       the host.  This lock will be held while sending the TRACE response to
+;       the host.
+;
+;     CMD_UNLOCK_OUT  -  Subroutine to release the host response stream lock.
+;       This routine will be called after the TRACE response has been sent.
+;
+;     CMD_PUT8  -  Subroutine to send the byte in the low 8 bits of W0 to the
+;       host.
+;
+;     CMD_PUT16  -  Subroutine to send the word in W0 to the host.
+;
+/include "pbptest.ins.dspic"
+
+;*******************************************************************************
+;
+;   Configuration constants.
+;
+/const   bufwords integer = 1000 ;size of trace buffer in 16 bit words
+/const   words_samp integer = 6 ;max allowed number of words per sample
+/const   trig_frac real = 0.5 ;default trigger position into buffer, 0.0 to 1.0
+
+/include "(cog)src/dspic/trace.ins.dspic"
+         .end

@@ -1,0 +1,12 @@
+ADDMOD pbptest_clock.o
+ADDMOD pbptest_cmd.o
+ADDMOD pbptest_cmds.o
+ADDMOD pbptest_init.o
+ADDMOD pbptest_main.o
+ADDMOD pbptest_port.o
+ADDMOD pbptest_pulse.o
+ADDMOD pbptest_strt.o
+ADDMOD pbptest_task.o
+ADDMOD pbptest_trace.o
+ADDMOD pbptest_trap.o
+ADDMOD pbptest_uart.o

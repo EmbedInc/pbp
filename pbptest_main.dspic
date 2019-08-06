@@ -1,0 +1,83 @@
+;   ***************************************************************
+;   * Copyright (C) 2015, Embed Inc (http://www.embedinc.com)     *
+;   *                                                             *
+;   * Permission to copy this file is granted as long as this     *
+;   * copyright notice is included in its entirety at the         *
+;   * beginning of the file, whether the file is copied in whole  *
+;   * or in part and regardless of whether other information is   *
+;   * added to the copy.                                          *
+;   *                                                             *
+;   * The contents of this file may be used in any way,           *
+;   * commercial or otherwise.  This file is provided "as is",    *
+;   * and Embed Inc makes no claims of suitability for a          *
+;   * particular purpose nor assumes any liability resulting from *
+;   * its use.                                                    *
+;   ***************************************************************
+;
+;   Main event loop.
+;
+/include "pbptest.ins.dspic"
+
+;*******************************************************************************
+;
+;   Configuration constants.
+;
+
+;
+;   Derived constants.
+;
+
+;*******************************************************************************
+;
+;   Variables.
+;
+;*******************
+;
+;   Global state.
+;
+.section .main,  bss
+
+;*******************
+;
+;   Local state.
+;
+
+.section .main_code, code
+;*******************************************************************************
+;
+;   Main operating loop entry point.  MAIN is jumped to from the INIT module
+;   after system level initialization is complete.
+;
+         glbent  main        ;jumps here from INIT after system initialization
+;
+;   Initialize state managed by this module before entering the main operating
+;   loop.
+;
+
+
+;********************
+;
+;   Main loop.
+;
+loop_main:
+         call    task_yield  ;give all other tasks a chance to run
+;
+;   Send the trace data to the host if all data after the trigger has been
+;   captured and this data has not previously been sent to the host.
+;
+         skip_flag tracefull ;all data after trigger has been collected ?
+         jump    no_trace    ;no
+         skip_nflag tracesent ;this data hasn't been previously sent ?
+         jump    no_trace
+
+         gcall   trace_send  ;send the captured trace to the host
+         gcall   trace_trigreset ;reset triggered condition, collect samples again
+         jump    loop_main
+
+no_trace:
+;
+;   All event conditions have been checked.  Go back to the start of the event
+;   loop to check them again.
+;
+         jump    loop_main   ;done with this iteration of this task
+.end
