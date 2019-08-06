@@ -1,0 +1,13 @@
+                             Program SHIFTVAL
+                                6 Aug 2019
+
+shiftval <highw> <loww> <shift>
+
+Show the value of a 32 bit fixed point number.
+
+HIGHW is the value of the high 16 bits as a unsigned integer, and LOWW is
+the value of the lo 16 bit words as a unsigned integer.
+
+SHIFT is the number of fraction bits in the 32 bit fixed point number.
+SHIFT may be negative to indicate that the binary point is actually to the
+right of the number.
