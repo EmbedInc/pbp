@@ -41,10 +41,10 @@
 ;   Debug switches.  All these should be set to FALSE for normal operation.
 ;
 /const   debug_icd bool = false ;build for debugging with in-circuit debugger
-/const   debug_icdram bool = true ;for ICD debugging, but without extra NOPs, etc
+/const   debug_icdram bool = false ;for ICD debugging, but without extra NOPs, etc
 /const   debug   bool = false ;build for any debugging, not necessarily RealIce
 /const   debug_showintr bool = false ;SYNC ouput high during interrupt
-/const   debug_break bool = true ;enable code for software-controlled breakpoints
+/const   debug_break bool = false ;enable code for software-controlled breakpoints
 
 /include "pbptestlib.ins.dspic"
 /include "pbptest_cmdrsp.ins.dspic"
@@ -101,6 +101,7 @@
 /flag    vhigh               ;voltage has been high since setpoint changed
 /flag    vlow                ;voltage has been low since setpoint changed
 /flag    dbgbreak            ;execute breakpoint code
+/flag    trigger             ;trigger condition has been met this iteration
 
 ;*******************************************************************************
 ;

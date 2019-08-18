@@ -11,8 +11,8 @@
 ;     AN1  -  Measure of input voltage.  This is converted to unsigned
 ;       millivolts and saved in VINMV each interrupt.
 ;
-;     AN2  -  Measure of output voltage.  This is converted to usigned
-;       millivolts and save in VLAST each interrupt.
+;     AN2  -  Measure of output voltage.  This is converted to unsigned
+;       millivolts and saved in VLAST each interrupt.
 ;
 ;     AN3  -  External reference voltage.  This is used as the positive
 ;       reference of the A/D.  The constant VREF below indicates the voltage,
@@ -28,9 +28,9 @@
 /const   debug_qload bool = true ;explicitly compute load current
 /const   debug_qloadr bool = true ;compute load current assuming fixed RLOAD
 /const   debug_rload real = 10.0 ;assumed fixed load, Ohms
+/const   debug_movenear bool = false ;move vars in near RAM to different location
 
-
-/const   dper    real = 12e-6 ;desired PWM period, seconds
+/const   dper    real = 12.5e-6 ;desired PWM period, seconds
 /const   vref    real = 2.5  ;A/D full scale reference voltage
 /const   adfull  integer = 16#FFF0 ;raw A/D reading for full scale
 /const   adppwm  integer = 3 ;A/D readings per PWM period
@@ -43,7 +43,8 @@
 /const   sat     real = 3.5  ;inductor saturation current, Amps
 /const   vd      real = 0.7  ;volts accross diode during inductor discharge
 /const   l       real = 100e-6 ;inductor value, Henrys
-/const   cap     real = 301e-6 ;output capacitor value, Farads
+; /const   cap     real = 301e-6 ;output capacitor value, Farads
+/const   cap     real = 250e-6 ;output capacitor value, Farads
 /const   i2pass  real = .95  ;fraction of computed I2 to pass to next cycle as I1
 /const   swon_on real = 100e-9 ;delay from SWON to switch on, seconds
 /const   swoff_off real = 300e-9 ;delay from SWOFF to switch off, seconds
@@ -57,10 +58,11 @@
 ;   defines the number of values to grab each sample.  If TRACE1 does not exist,
 ;   then the trace mechanism is disabled.
 ;
-/const   trace1  = "qload"   ;input voltage
-/const   trace2  = "vlast"   ;output voltage
-/const   trace3  = "i1"      ;inductor starting current
-/const   trace4  = "ton"     ;inductor on time
+/const   trace1  = "vlast"   ;output voltage at start of this interval
+/const   trace2  = "ton"     ;switch on time, instruction cycles
+/const   trace3  = "ip"      ;peak inductor current, at TON into pulse
+/const   trace4  = "i2"      ;inductor current at end of pulse
+/const   trace5  = "i1"      ;inductor current at start of pulse
 
 /const   trigpos real = 0.5  ;0 to 1 trigger position within buffer
 ;
@@ -181,9 +183,15 @@
 ;
 ;   Global state.
 ;
-.section .pulse, bss, near
+.section .near_pulse, bss, near
 
 allocg   vreg                ;output regulation value, mV
+
+
+/if debug_movenear then
+         alloc   padding, 6  ;unused padding to move subsequent variables
+  /endif
+
 
 ;*******************
 ;
@@ -276,17 +284,8 @@ alloc    save_w5
 alloc    save_w6
 alloc    save_w7
 
-/if debug then
-         .global satma, vdmv
-         .global vinmv, vlast
-         .global vprev, ir, qthis, qlast
-         .global i2, qnext
-         .global gp, von, voff, ton, ip, td
-         .global xa, xas, xb, xbs, xc, xcs
-  /endif
 
-
-.section .pulse_code, code
+.section .code_pulse, code
 ;*******************************************************************************
 ;
 ;   Subroutine PULSE_INIT
@@ -330,7 +329,7 @@ alloc    save_w7
 ;   Set up timer 5 for the A/D conversion period.  The timer is set up but not
 ;   yet started.
 ;
-;   A timer event is need to trigger each individual A/D conversion.  Since we
+;   A timer event is needed to trigger each individual A/D conversion.  Since we
 ;   scan three channels, timer 5 must run at 3x the PWM rate.  The PWM period
 ;   was computed to be a multiple of 3 instruction cycles.  3 timer 5 triggers
 ;   will be exactly one PWM period.
@@ -579,7 +578,7 @@ alloc    save_w7
 ;   new pulse computation.
 ;
 /if [> ntrace 0] then        ;data tracing is enabled ?
-  /var new ii integer
+  /var local ii integer
 
          mov     #[v ntrace], w0 ;set number of data values per sample
          gcall   trace_nwords
@@ -599,8 +598,6 @@ alloc    save_w7
   /set ii [max 0 [min 65535 ii]]
          mov     #[v ii], w0 ;pass the 0-65535 trigger position within trace buffer
          gcall   trace_trigpos
-
-  /del ii
   /endif
 ;
 ;   Timer 5 and the master PWM timebase must be in sync so that the last A/D
@@ -638,8 +635,7 @@ alloc    save_w7
 ;   Sends the MVAL response, which reports the latest measured analog input
 ;   values.
 ;
-         glbent  cm_mval
-
+/if [Command cm_mval] then
          gcall   cmd_lock_out
          mov     #[v rsp_mval], w0
          gcall   cmd_put8    ;send MVAL response opcode
@@ -655,15 +651,16 @@ alloc    save_w7
          mov     vlast, w0
          gcall   cmd_put16   ;send output level, mV
          return
+  /endif
 
 ////////////////////////////////////////////////////////////////////////////////
 //
 //   Macro NORM16U
 //
 //   Normalize the 32 bit unsigned integer in W1:W0 into the single 16 bit
-//   signed integer in W0.  W2 contains the number of bits the number is shifted
-//   left from its true value.  W2 will be updated to be the shift count for the
-//   result in W0.
+//   signed integer in W0.  W2 contains the number of bits the number is
+//   shifted left from its true value.  W2 will be updated to be the shift count
+//   for the result in W0.
 //
 //   W1 and W3 are trashed.
 //
@@ -842,12 +839,12 @@ alloc    save_w7
          ;   Shift W5:W4 right by -W6 bits.
          ;
 [lab shiftb]:
-         neg     w6, w6      ;make bits to shift W4:W5 right
          ior     w1, w0, w7  ;check for other value is 0
          bra     nz, [lab notza] ;other value is not 0 ?
          mov     w3, w2      ;other is 0, set it to our shift count
          jump    [lab done]
 [lab notza]:
+         neg     w6, w6      ;make bits to shift W4:W5 right
          sub     w3, w6, w3  ;update the shift count
          cp      w6, #15
          bra     geu, [lab highsb] ;high word will only contain sign
@@ -947,21 +944,19 @@ alloc    save_w7
          ;   The candidate square root will be built in W3 with W5:W4 used as
          ;   the square of the candidate.
          ;
-         mov     #0, w3      ;init the square root candidate
-  /set ii 16                 ;init number of last bit determined
-  /block                     ;back here to write the code for each iteration
-    /set ii [- ii 1]         ;make number of the bit to determine this iteration
-    /if [< ii 0] then        ;all done ?
-      /quit
+  /loop with ii from 15 to 0 by -1 ;loop over the result bits, II is bit number
+    /if [= ii 15]
+      /then
+         mov     #0x8000, w3 ;init result with first bit set
+      /else
+         bset    w3, #[v ii] ;set the bit being tested to 1
       /endif
-         bset    w3, #[v ii] ;set the bit to start the iteration
          mul.uu  w3, w3, w4  ;square the candidate
          cp      w4, w0      ;compare square to the input number
          cpb     w5, w1
-         skip_leu
-         bclr    w3, #[v ii] ;square was too large, clear the bit
-    /repeat
-    /endblock
+         skip_leu            ;square didn't exceed input number ?
+         bclr    w3, #[v ii] ;square was too large, clear this bit
+    /endloop
          cp0     w3
          bra     nz, [lab nonzero] ;not special case of returning zero ?
          ;
@@ -1082,7 +1077,7 @@ alloc    save_w7
          ;   number of bits to shift the quotient right is simply W2-W3.
          ;
          sub     w2, w3, w2  ;make shift number in W2
-         asr     w0, w2, w0  ;adjust result to true scale
+         lsr     w0, w2, w0  ;adjust result to true scale
 ;
 ;   W0 contains the solution of the quadratic.
   /write ""
@@ -1245,7 +1240,7 @@ alloc    save_w7
   /var local sh integer
   /var local ii integer
          ;
-         ;   Compute the total charge that will be delivered by this next pulse.
+         ;   Compute the total charge that will be delivered by the next pulse.
          ;   In our units:
          ;
          ;           (I1 + Ip) Ton + (Ip + I2) Td
@@ -1324,13 +1319,13 @@ alloc    save_w7
 //
 /if false then
 pulse_debug:                 ;jumps here from init routine
-         setvar  25000, vinmv ;measured input, mV
-         setvar  15000, vreg ;output regulation level, mV
-         setvar  14990, vlast ;measured output, mV
-         setvar  14985, vprev ;output at start of last pulse, mV
-         setvar  50, i1      ;starting inductor current, mA
-         setvar  300, qthis  ;average mA delivered this pulse
-         setvar  200, qlast  ;average mA delivered last pulse
+         setvar  19270, vinmv ;measured input, mV
+         setvar  3300, vreg  ;output regulation level, mV
+         setvar  3309, vlast ;measured output, mV
+         setvar  3296, vprev ;output at start of last pulse, mV
+         setvar  0, i1       ;starting inductor current, mA
+         setvar  247, qthis  ;average mA delivered this pulse
+         setvar  636, qlast  ;average mA delivered last pulse
   /endif
 //
 //***** END DEBUG *****
@@ -1361,6 +1356,13 @@ pulse_debug:                 ;jumps here from init routine
          mov     vlast, w0   ;save Vout + Vd as Voff
          add     vdmv, wreg
          mov     w0, voff
+
+
+  /if debug_break then
+break_restart:
+         nop                 ;debugger breakpoint and restart target
+         nop
+    /endif
 ;
 ;   Check for special case where the measured Vin is less than the measured
 ;   Vout, which should never actually happen anyway.  If so, just do a 0 length
@@ -1370,19 +1372,6 @@ pulse_debug:                 ;jumps here from init routine
          mov     vinmv, w0   ;get the input voltage
          cp      vlast       ;compare last measured output voltage to input voltage
          bra     geu, pulse_zero ;Vout >= Vin, do a zero length pulse
-
-
-
-  /if debug_break then
-         skip_flag dbgbreak  ;breakpoint requested ?
-         jump    n_dbgbreak  ;no, skip this section
-         clr     Mdc         ;set duty cycle to 0 during single stepping
-         nop                 ;instruction to set breakpoint on
-         clrflag dbgbreak    ;clear the break event condition
-n_dbgbreak:
-    /endif
-
-
 
 //////////////////////////////
 //
@@ -1424,16 +1413,17 @@ n_dbgbreak:
 ;   produce next pulse, without ever being computed directly.  It can be useful
 ;   for debugging to see the load current that other values are based on.
 ;
-;           Vlast
-;   Qload = -----
-;           Rload
+;           Vprev + Vlast
+;   Qload = -------------
+;              2 Rload
 ;
-    /set r [/ 1 debug_rload] ;raw mult factor
+    /set r [/ .5 debug_rload] ;raw mult factor
     /set ii [rnd [* r 65536]] ;integer mult factor for result in high word
 
-         mov     vlast, w0   ;get the output voltage
+         mov     vprev, w0   ;get the starting voltage of the interval
+         add     vlast, wreg ;add the ending voltage of the interval
          mov     #[v ii], w1 ;get the 1/R mult factor
-         mul.uu  w0, w1, w0  ;Vout/Rload --> W1
+         mul.uu  w0, w1, w0  ;Ave(Vprev,Vlast)/Rload --> W1
          mov     w1, qload   ;save load current
 
     /endif
@@ -1475,8 +1465,6 @@ n_dbgbreak:
          mul.uu  w2, #2, w2
          add     w0, w2, w0  ;add it into W1:W0
          addc    w1, w3, w1
-
-         jump    qp_w1w0     ;desired charge next pulse is in W1:W0
     /endif
 //
 //////////////////////////////
@@ -1579,8 +1567,8 @@ qp_w1w0:
 ;               L
 ;
 ;   MinTon and L are preprocessor constants in seconds and Henrys, repsectively.
-;   Von is a measured values available in mV.  Using these all these values
-;   directly results in a current in mA, which is the units we want.
+;   Von is a measured value available in mV.  Using all these values directly
+;   results in a current in mA, which is the units we want.
 ;
 ;   MinTon / L is pre-computed and the result multiplied by 2^16.  This causes
 ;   the result of the multiply in the desired units to be in the high word of
@@ -1607,12 +1595,12 @@ qp_w1w0:
          ;   W0 contains the inductor peak current (Ip) for a minimum length
          ;   pulse.  This has been checked to not exceed the saturation limit.
          ;
-         ;   Now compute the inductor ending current (I2).  If this is computed
-         ;   to be negative, then the pulse is discontinuous.  In that case, the
-         ;   the inductor current goes to zero and then stays zero before the
-         ;   end of the pulse.  This case needs to be detected because the
-         ;   charge delivered by the pulse is computed differently for
-         ;   continuous and discontinuous mode.
+         ;   Now compute the inductor ending current (I2) for a minimum pulse.
+         ;   If this is computed to be negative, then the minimum pulse is
+         ;   discontinuous.  In that case, the inductor current goes to zero and
+         ;   then stays zero before the end of the pulse.  This case needs to be
+         ;   detected because the charge delivered by the pulse is computed
+         ;   differently for continuous and discontinuous mode.
          ;
          ;   Since the on-time is known up front (MinTon) in this case, the off
          ;   time is also known (Tp - MinTon).  The inductor current decrease
@@ -1631,7 +1619,7 @@ qp_w1w0:
 
          mov     voff, w2    ;get Voff
          mov     #[v ii], w3 ;(Tp-MinTon)/L mult factor for high word result
-         mul.uu  w2, w3, w2  ;make Id in W3
+         mul.uu  w2, w3, w2  ;make ind curr drop during off time in W3
 
          cp      w3, w0      ;compare Id to Ip
          bra     gtu, minp_disc ;minimum pulse is discontinuous ?
@@ -1650,7 +1638,7 @@ qp_w1w0:
          ;   Now compute the charge delived by this pulse and do a zero-length
          ;   pulse if it exceeds the charge to deliver next pulse (Qp).
          ;
-         ;   The charge delivered by a continuous mode, in our units, is:
+         ;   The charge delivered by a continuous mode pulse, in our units, is:
          ;
          ;            (Ip + I1) Ton   (Ip + I2) Td
          ;     Qmin = ------------- + ------------
@@ -1762,11 +1750,12 @@ minp_disc:                   ;mininum pulse is discontinuous
 ;
 ;   Decide whether this pulse will be in continuous or discontinuous mode.
 ;   Continuous mode means there will be some (non-zero) current in the inductor
-;   at the end of the pulse.  It is useful to decide this up front since different
-;   equations have to be solved to find Ton depending on which mode the pulse
-;   will be in.  These envolve solving quadratics with the associated square root,
-;   so it is better to do a few simpler calculations up front to determine which
-;   quadartic to solve, than to solve one and find the other needs to be solved.
+;   at the end of the pulse.  It is useful to decide this up front since
+;   different equations have to be solved to find Ton depending on which mode
+;   the pulse will be in.  These envolve solving quadratics with the associated
+;   square root, so it is better to do a few simpler calculations up front to
+;   determine which quadartic to solve, than to solve one and find the other
+;   needs to be solved.
 ;
 ;   The pulse will be in discontinuous mode if the maximum charge that can be
 ;   delivered that way is sufficient, or the maximum discontinuous pulse would
@@ -1775,8 +1764,8 @@ minp_disc:                   ;mininum pulse is discontinuous
 ;   To determine which mode, we first solve for the Ton value that causes the
 ;   inductor current to get to exactly 0 at the end of the pulse.  From that we
 ;   can calculate the inductor peak current, check that against the saturation
-;   current, and compute the delivered charge from this maximum discontinuous mode
-;   pulse.
+;   current, and compute the delivered charge from this maximum discontinuous
+;   mode pulse.
 ;
 ;   It has already been determined that the minimum allowed Ton (other than 0)
 ;   results in a discontinous pulse, that this pulse would not saturate the
@@ -1918,9 +1907,9 @@ minp_disc:                   ;mininum pulse is discontinuous
 ;
 ;   Do a discontinous mode pulse.
 ;
-;   We already know that the minimum pulse does not saturate the inductor and
-;   does not deliver enough charge, and that the minimum continuous mode pulse
-;   either saturates the inductor or delivers too much charge.
+;   We know that the minimum pulse does not saturate the inductor and does not
+;   deliver enough charge, and that the minimum continuous mode pulse either
+;   saturates the inductor or delivers too much charge.
 ;
 mode_discont:
          ;
@@ -2074,7 +2063,7 @@ mode_discont:
 ;
 ;   Do a continuous mode pulse.
 ;
-;   We already know that the minumum continuous mode pulse does not saturate the
+;   We know that the minumum continuous mode pulse does not saturate the
 ;   inductor and does not deliver enough charge.
 ;
 mode_cont:
@@ -2403,15 +2392,48 @@ zero_disc:
 ;
 pulse_done:
 ;
+;   Set the TRIGGER flag according to whether the trigger condition has been
+;   met.  This is only done if the trigger condition will be used below, which
+;   is true if either tracing is enabled, or runtime breakpoints are enabled.
+;
+  /if [or debug_break [> ntrace 0]] then ;trigger condition will be used below ?
+         clrflag trigger     ;init to the trigger condition has not been met
+         mov     ton, w0     ;get inductor on time, cycles
+         mov     #[rnd [* percy 0.95]], w1 ;get min pulse length for trigger
+         cp      w0, w1
+         skip_ltu            ;not long enough to trigger ?
+         setflag trigger     ;is long enough, set trigger condition
+    /endif
+;
+;   Do a breakpoint if runtime breakpoints are enabled, and the breakpoint
+;   condition has been met.
+;
+  /if debug_break then
+         skip_flag dbgbreak  ;run time breakpoint enable is set ?
+         jump    n_dbgbreak  ;no, skip this section
+         skip_flag trigger   ;the trigger condition has been met ?
+         jump    n_dbgbreak  ;no, skip this section
+         ;
+         ;   Break.
+         ;
+         clrflag dbgbreak    ;clear the run-time breakpoint enable
+         clr     Mdc         ;set duty cycle to 0 during single stepping
+
+         nop                 ;instruction to set breakpoint on
+         nop
+         nop
+         jump    break_restart ;back to single-step thru same calculations
+
+n_dbgbreak:
+    /endif
+;
 ;   Save a trace sample if this is enabled.
 ;
-
   /if [> ntrace 0] then
          gcall   trace_sample ;grab another trace sample
-         mov     ton, w0     ;get inductor on time, cycles
-         cp0     w0
-         bra     z, dtrace
-         gcall   trace_trigger
+         skip_flag trigger   ;the trigger condition has been met ?
+         jump    dtrace      ;no, skip this section
+         gcall   trace_trigger ;trigger the trace system on this sample
 dtrace:                      ;done logging trace data
     /endif
 ;
@@ -2421,7 +2443,6 @@ dtrace:                      ;done logging trace data
          mov     w0, qlast
          mov     qnext, w0
          mov     w0, qthis
-
          mov     vlast, w0   ;advance the measured voltage
          mov     w0, vprev
 

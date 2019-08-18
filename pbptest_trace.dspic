@@ -48,7 +48,7 @@
 ;
 ;     TRACE_TRIGPOS
 ;
-;       Susbroutine that sets the trigger position within the trace buffer.  W0
+;       Subroutine that sets the trigger position within the trace buffer.  W0
 ;       contains 0-65535, which maps linearly from the start to the end of the
 ;       buffer.  Any current trigger condition is reset.
 ;
@@ -100,7 +100,7 @@
 ;
 ;       Global flag that indicates that a trigger has occurred and that all
 ;       samples following the trigger have been collected.  This flag together
-;       with FLAG_TRACEUSED can be used by the application to call TRACE_SEND.
+;       with FLAG_TRACESENT can be used by the application to call TRACE_SEND.
 ;
 ;     FLAG_TRACESENT
 ;
@@ -114,8 +114,8 @@
 ;     TRACE_SETUP.INS.DSPIC  -  This file must be included by the project
 ;       include file.
 ;
-;     RSP_TRACE  -  Assembler symbolic constant for the TRACE host response
-;       opcode for sending trace data.
+;     RSP_TRACE  -  Preprocessor constant for the TRACE host response opcode
+;       for sending trace data.
 ;
 ;     CMD_LOCK_OUT  -  Subroutine to acquire the exclusive lock on sending to
 ;       the host.  This lock will be held while sending the TRACE response to

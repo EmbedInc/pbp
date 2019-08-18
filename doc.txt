@@ -1,0 +1,195 @@
+                             PBPTEST Firmware
+                              18 August 2019
+
+
+This firmware is for testing and demonstrating the Pulse by Pulse method
+of switching power supply control.  It runs on a Microchip PIC
+dsPIC33EP32MC202, on the Embed Inc PBP board.
+
+The input and output volages of a buck converter are measured each pulse,
+then the switch turned on for the exact time to get the output voltage to
+the regulation threshold, assuming the load is drawing the same current as
+in the previous two cycles.  The computations can include solving a
+quadratic, which requires calculating a square root.
+
+
+Communication Protocol
+
+  The processor can communicate with a host computer via UART.  This is
+  for debugging, and control during testing of the concept.  3.3 V power,
+  ground, and the 0-3.3 V UART signals are on a 4-pin connector labeled
+  "Serial" on the PBP board.
+
+  The protocol is two independent byte streams, one in each direction.
+  Both ways, data is transferred in packets that start with a opcode byte,
+  possibly followed by data bytes as defined for that opcode.  Packets
+  from the host computer to this processor are referred to as "commands",
+  with packets from the processor to the host computer as "responses",
+  although they may not always be sent in direct response to commands.
+  Commands and responses each have their own separate opcode space.
+
+  Unless otherwise noted in the descriptions below, data values are
+  unsigned integers, their size is 8 bits, and multi-byte fields are
+  transmitted in most to least significant byte order.  Floating point
+  values are in Embed Inc 32 bit dsPIC fast floating point format.
+
+  In the command and response listings below, the name of each command or
+  response is shown, followed by a colon, followed by the opcode value,
+  followed by the description of any data values following the opcode
+  byte.
+
+  Commands
+
+    NOP: 0
+
+      This command is guaranteed to always be ignored.  Sending as many
+      NOP commands as there are bytes in the longest possible command
+      guarantees that the processor will interpret the next byte as the
+      opcode of a new command.
+
+    PING: 1
+
+      Causes a PONG response to be sent.  This can be useful to verify the
+      bi-directional communication channel.  It can also be used to verify
+      that the processor has executed a previous sequence of commands that
+      do not contain PING.
+
+    FWINFO: 2
+
+      Causes a FWINFO response to be sent, which reports the firmware
+      version and other information.
+
+    VSET: 3 mv
+
+      Set the output voltage regulation point.  MV is 16 bits in units of
+      millivolts.
+
+    GVSET: 4
+
+      Causes the VSET response to be sent, which indicates the output
+      voltage set point.
+
+    MVAL: 5
+
+      Causes the MVAL response to be sent, which reports the latest
+      measured analog values.
+
+    ARM: 6
+
+      Set up the trace mechanism so that the next trigger is valid.
+
+    TRIG: 7
+
+      Explicitly trigger the trace mechanism.  The trace mechanism will be
+      armed first if necessary.
+
+    TOFF: 8
+
+      Disable the trace mechanism.  This is the reverse of arming it.
+
+    BREAK: 9
+
+      Sets the internal DBGBREAK flag.  This is intended for debugging.
+      The DBGBREAK flag has no meaning during normal operation.
+
+  Responses
+
+    NOP: 0
+
+      This is a valid response, but otherwise has no meaning.  The host
+      must tolerate receiving a NOP at any time a response opcode byte is
+      expected.
+
+    PONG: 1
+
+      Sent in response to the PING command only.
+
+    FWINFO: 2 type version sequence
+
+      Sent asynchronously once shortly after power up and then only in
+      response to a FWINFO command.  TYPE is the firmware type ID, which
+      is 43 for the PBPTEST firmware.  VERSION is the firmware version,
+      and SEQUENCE is the unique build sequence number within that
+      version.
+
+      Multiple builds with the same version number may be done during
+      development.  However, only one build per version is ever released.
+      The details of released versions is given in a later section of this
+      document.  The sequence number of the released build of each version
+      is also given.  The action of firmware with other than the released
+      sequence number for its version is undefined.  Such firmware should
+      not be used in production.
+
+    VSET: 3 mv
+
+      Reports the output voltage setpoint.  MV is 16 bits in units of
+      millivolts.
+
+    MVAL: 4 an0 vin vout
+
+      Reports the latest values of the measured analog signals.  All
+      parameters are unsigned 16 bit integers.
+
+      AN0 is the voltage on the AN0 analog input with 0-65535 representing
+      the full scale A/D range, which is 0.0 to 2.5 volts on the PBP
+      hardware.
+
+      VIN is the input voltage in mV, and VOUT is the output voltage in
+      mV.
+
+    TRACE: 5 nsamp wordps trigofs word...word
+
+      Data for a complete trace.  NSAMP is the 16 bit number of samples in
+      the trace.  WORDPS is the number of words per sample.  TRIGOFS is
+      the 16 bit offset of the trigger sample within the data.  0 means
+      the trigger ocurred on the first sample, and NSAMP-1 indicates the
+      last sample.  The special value NSAMP indicates this response is
+      sending a dump of the trace buffer without a trigger having occured.
+
+      There are exactly NSAMP*WORDPS 16 bit words following TRIGOFS.
+      Samples are sent in buffer order, with the individual values within
+      each sample in consecutive words.
+
+
+Firmware Versions
+
+  PBPTEST 1 seq 83, 26 May 2015
+
+    The basic logic seems to work.  Implements commands NOP, PING, FWINFO,
+    VSET, GVSET, MVAL, ARM, TRIG, and TOFF.  Implements responses NOP,
+    PONG, FWINFO, VSET, MVAL, and TRACE.
+
+    Currently, the measured output voltage resolution is too low.  Small
+    amounts of noise, and even the jump between adjacent counts can cause
+    the algorithm to over-react.
+
+  PBPTEST 2 seq 11, 2 Oct 2016
+
+    Adjusted to modified hardware with lower output voltage range.  This
+    was done to get better output voltage resolution with the existing
+    A/D.  Each A/D LSB is now 1 mV, which is the scale of the values used
+    internally.  The output voltage range is now 0 to 4.095 volts.  The
+    default output voltage was changed from 5.0 to 3.3 V.
+
+  PBPTEST 3 seq 56, 18 Aug 2019
+
+    Added host-triggered software-detected breakpoint capability.
+    Breakpoint code is only included when the new DEBUG_BREAK build switch
+    is enabled.
+
+    Added new DEBUG_ICDRAM switch to build system.  This causes the memory
+    for the ICD to be reserved, but without source changes included in the
+    DEBUG_ICD switch. DEBUG_ICD forces DEBUG_ICDRAM.
+
+    Added optional desired charge for next pulse computation for
+    debugging.
+
+    Moved into GIT repository, and updated to the latest build system.
+    The source for this doc file is now in the GIT repository, not in the
+    Embed DOC directory as before.
+
+    Updated to some code found in olin/pbp, which seemed to be newer than
+    that in Embed source/pbp.  It looks like this included one or two bug
+    fixes in the pulse computation, and some changes to what gets traced.
+
+    The released sequence of this version builds, but was not tested.
