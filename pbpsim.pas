@@ -49,13 +49,14 @@ var
 {
 *   Input parameters for computing pulse.
 }
-  l: real;                             {inductance, Henries}
+  lass: real;                          {assumed inductance, H}
+  lact: real;                          {actual inductance, H}
   sat: real;                           {inductor saturation current, A}
   tp: real;                            {PWM period, seconds}
   minon: real;                         {min allowed Ton, seconds}
   vin, vout: real;                     {input and output voltages}
   vd: real;                            {voltage accross diode during discharge}
-  i1: real;                            {initial inductor current, Amps}
+  i1: real;                            {assumued initial inductor current, Amps}
   qp: real;                            {charge to deliver, C}
 {
 *   Parameters computed each pulse.
@@ -63,12 +64,13 @@ var
   ton: real;                           {switch on time, seconds}
   td: real;                            {inductor discharge time, non-zero curr, A}
   ip: real;                            {peak inductor current during pulse, A}
-  i2: real;                            {inductor current at end of pulse, A}
+  i2: real;                            {assumed inductor current at end of pulse, A}
   qd: real;                            {charge actually delivered during pulse, C}
 {
 *   Parameters to determine the requested charge (Qp) from the next pulse.
 }
-  cap: real;                           {output capacitance value, F}
+  cass: real;                          {assumed output capacitance, F}
+  cact: real;                          {actual output capactiance, F}
   vreg: real;                          {output regulation level}
   vlast: real;                         {Vout before the last pulse}
   vprev: real;                         {Vout one pulse before that}
@@ -76,6 +78,9 @@ var
   load: real;                          {simulated output load, Amps}
   compq: boolean;                      {compute desired output charge next pulse}
 
+  iact: real;                          {actual starting inductor current, A}
+  errl: real;                          {error fraction for inductance}
+  errc: real;                          {error fraction for capacitance}
   log: boolean;                        {data is being logged to CSV file}
   logt: double;                        {log file data time}
   procid: sys_sys_proc_id_t;           {scratch process ID}
@@ -110,25 +115,43 @@ label
 procedure show_state;
   val_param; internal;
 
+var
+  err: real;                           {error percent, real to assumed}
+
 begin
   lockout;
+  err := 100.0 * (lass - lact) / lact; {percent error}
+  write ('Inductance '); weng (lass, 3, 'H');
+  write (', err '); wfp (err, 1); writeln ('%'); writeln;
 
-  write ('Inductance '); weng (l, 3, 'H'); writeln;
   write ('Saturation '); weng (sat, 3, 'A'); writeln;
+
   write ('PWM period '); weng (tp, 3, 's');
+
   write (' ('); weng(1.0/tp, 3, 'Hz'); writeln (' rate)');
+
   write ('Min allowed on time '); weng (minon, 3, 's'); writeln;
+
   write ('Diode drop '); weng(vd, 3, 'V'); writeln;
+
   write ('Initial inductor current '); weng (i1, 3, 'A'); writeln;
-  write ('Output capacitance '); weng (cap, 3, 'F'); writeln;
+
+
+  err := 100.0 * (cass - cact) / cact; {percent error}
+  write ('Output capacitance '); weng (cact, 3, 'F');
+  write (', err '); wfp (err, 1); writeln ('%'); writeln;
+
   write ('Regulation voltage '); weng (vreg, 3, 'V'); writeln;
+
   write ('Load current '); weng (load, 3, 'A'); writeln;
 
   write ('Vin '); weng(vin, 3, 'V');
-  write (', Vout '); weng (vout, 4, 'V'); writeln;
-  write ('Charge to deliver '); weng(qp, 3, 'C');
-  write (' ('); weng(qp/tp, 3, 'A'); writeln (' average rate)');
 
+  write (', Vout '); weng (vout, 4, 'V'); writeln;
+
+  write ('Charge to deliver '); weng(qp, 3, 'C');
+
+  write (' ('); weng(qp/tp, 3, 'A'); writeln (' average rate)');
   unlockout;
   end;
 {
@@ -141,7 +164,7 @@ begin
 *
 *   The input parameters are:
 *
-*     L  -  Inductor value, Henries
+*     LASS  -  Assumed innductor value, Henries
 *
 *     SAT  -  Inductor saturation current, Amps.  The pulse is adjusted as
 *       necessary so that the peak current during the pulse does not exceed
@@ -196,11 +219,11 @@ begin
 *   full solution to Ton later won't result in a negative Ton value.
 }
   ton := minon;                        {set switch on time to minimum allowed}
-  ip := i1 + (vin - vout) * ton / l;   {peak current}
+  ip := i1 + (vin - vout) * ton / lass; {peak current}
   if ip > sat then goto nopulse;       {would exceed inductor saturation limit ?}
 
   td := tp - ton;                      {init to discharge whole rest of pulse}
-  i2 := ip - (vout + vd) * td / l;     {curr at end of discharge}
+  i2 := ip - (vout + vd) * td / lass;  {curr at end of discharge}
   if i2 >= 0.0 then begin              {min pulse is continuous ?}
     qd :=                              {find charge delivered, continuous mode}
       ((i1 + ip) * ton + (ip + i2) * td) / 2.0;
@@ -211,7 +234,7 @@ begin
   *   The minimum pulse is in discontinuous mode.
   }
   i2 := 0.0;                           {discontinuous, ending current will be 0}
-  td := ip * l / (vout + vd);          {compute discharge time}
+  td := ip * lass / (vout + vd);       {compute discharge time}
   qd :=                                {find charge delivered, discontinous mode}
     ((i1 + ip) * ton + ip * td) / 2.0;
 
@@ -219,11 +242,11 @@ begin
 nopulse:                               {do pulse with Ton 0}
     ton := 0;                          {inductor on time}
     ip := i1;                          {peak current is initial current}
-    i2 := i1 - (vout + vd) * tp / l;   {curr at end of pulse}
+    i2 := i1 - (vout + vd) * tp / lass; {curr at end of pulse}
     if i2 < 0.0                        {inductor fully discharges before pulse end ?}
       then begin                       {discontinuous}
         i2 := 0.0;                     {ending current is zero}
-        td := ip * l / (vout + vd);    {discharge time}
+        td := ip * lass / (vout + vd); {discharge time}
         end
       else begin                       {continuous}
         td := tp;                      {discharging during the whole pulse}
@@ -257,10 +280,10 @@ nopulse:                               {do pulse with Ton 0}
 *   other words, we already know Ton will be at least MINON.
 }
   ton :=                               {find Ton at cont/discont boundary}
-    ((vout + vd) * tp - i1 * l) / (vin + vd);
+    ((vout + vd) * tp - i1 * lass) / (vin + vd);
   td := tp - ton;                      {inductor discharge time}
   ip :=                                {peak inductor current for this Ton}
-    i1 + (vin - vout) * ton / l;
+    i1 + (vin - vout) * ton / lass;
   if ip > sat then goto mode_discont;  {discont already saturates inductor ?}
 
   qd :=                                {charge delivered by max discont pulse}
@@ -276,24 +299,24 @@ mode_discont:
   i2 := 0.0;                           {ending inductor current will be 0}
 
   xa :=                                {make the quadratic coef for finding Ton}
-    (vin - vout) / (2.0 * l) + sqr(vin - vout) / (2.0 * l * (vout + vd));
+    (vin - vout) / (2.0 * lass) + sqr(vin - vout) / (2.0 * lass * (vout + vd));
   xb :=
     i1 + (vin - vout) * i1 / (vout + vd);
   xc :=
-    sqr(i1) * l / (2.0 * (vout + vd)) - qp;
+    sqr(i1) * lass / (2.0 * (vout + vd)) - qp;
   x1 :=                                {B^2 - 4AC}
     sqr(xb) - (4.0 * xa * xc);
   if x1 < 0.0 then goto nopulse;       {no solution ? (shouldn't happen)}
   ton := (-xb + sqrt(x1)) / (2.0 * xa); {find Ton to deliver the desired charge}
 
   ip :=                                {peak inductor current for this Ton}
-    i1 + (vin - vout) * ton / l;
+    i1 + (vin - vout) * ton / lass;
   if ip > sat then begin               {desired Ton oversaturates the inductor ?}
-    ton := (sat - i1) * l / (vin - vout); {Ton to just saturate the inductor}
+    ton := (sat - i1) * lass / (vin - vout); {Ton to just saturate the inductor}
     ip := sat;
     end;
 
-  td := ip * l / (vout + vd);          {inductor discharge time}
+  td := ip * lass / (vout + vd);       {inductor discharge time}
   qd :=                                {delivered charge}
     ((i1 + ip) * ton  + ip * td) / 2.0;
   return;
@@ -304,12 +327,12 @@ mode_discont:
 }
 mode_cont:
   xa :=                                {make quadratic coef for finding Ton}
-    -(vin + vd) / (2.0 * l);
+    -(vin + vd) / (2.0 * lass);
   xb :=
-    (vin + vd) * tp / l;
+    (vin + vd) * tp / lass;
   xc :=
     (i1 * tp)
-    - ((vout + vd) * sqr(tp) / (2.0 * l))
+    - ((vout + vd) * sqr(tp) / (2.0 * lass))
     - qp;
   x1 :=                                {B^2 - 4AC}
     sqr(xb) - (4.0 * xa * xc);
@@ -324,16 +347,16 @@ mode_cont:
     ;
 
   ip :=                                {peak inductor current}
-    i1 + (vin - vout) * ton / l;
+    i1 + (vin - vout) * ton / lass;
   if ip > sat then begin               {inductor would saturate ?}
     ton :=                             {find Ton to just saturate the inductor}
-     (sat - i1) * l / (vin - vout);
+     (sat - i1) * lass / (vin - vout);
     ip := sat;
     end;
 
   td := tp - ton;                      {inductor discharge time}
   i2 :=                                {ending inductor current}
-    ip - (vout + vd) * td / l;
+    ip - (vout + vd) * td / lass;
   qd :=                                {total charge delivered}
     ((i1 + ip) * ton + (ip + i2) * td) / 2.0;
   end;                                 {end of COMPUTE_PULSE}
@@ -385,7 +408,7 @@ begin
 }
   q := (i1 * 0.75 + ip * 0.25) * ton / 2.0; {charge dumped onto output}
   q := q - load * ton / 2.0;           {minus charge drained by the load}
-  v := vlast + q / cap;                {Vout updated to charge}
+  v := vlast + q / cass;               {Vout updated to charge}
 
   if ton > (tp / 1000.0) then begin    {Ton long enough to make separate data point ?}
     logpoint (logt + ton / 2.0, (i1 + ip) / 2.0, load, v);
@@ -395,7 +418,7 @@ begin
 }
   q := (i1 + ip) * ton / 2.0;          {charge dumped onto output}
   q := q - load * ton;                 {minus charge drained by the load}
-  v := vlast + q / cap;                {Vout updated to charge}
+  v := vlast + q / cass;               {Vout updated to charge}
 
   if ton > (tp / 1000.0) then begin    {Ton long enough to make separate data point ?}
     logpoint (logt + ton, ip, load, v);
@@ -405,14 +428,14 @@ begin
 }
   q := (ip * 0.75 + i2 * 0.25) * td / 2.0; {charge onto cap during Td}
   q := q - load * td / 2.0;            {minus charge drained by the load}
-  logpoint (logt + ton + td / 2.0, (ip + i2) / 2.0, load, v + q / cap);
+  logpoint (logt + ton + td / 2.0, (ip + i2) / 2.0, load, v + q / cass);
 {
 *   Write points to end of inductor discharge phase if this is a discontinous
 *   mode pulse.
 }
   q := (ip + i2) * td / 2.0;           {charge onto cap during Td}
   q := q - load * td;                  {minus charge drained by the load}
-  v := v + q / cap;                    {Vout updated to charge during Td}
+  v := v + q / cass;                   {Vout updated to charge during Td}
 
   if (ton + td) < (tp * 0.999) then begin {discontinuous mode ?}
     logpoint (logt + ton + td, 0.0, load, v);
@@ -423,6 +446,60 @@ begin
   logpoint (logt + tp, i2, load, vout);
 
   logt := logt + tp;                   {update data time for start of next pulse}
+  end;
+{
+****************************************************************************
+*
+*   Subroutine UPDATE_ACTUAL
+*
+*   Update the actual values from the switch on time, TON.  This keeps track
+*   of what the circuit is really doing, not what the control algorithm
+*   thinks it is doing.  The two may be different due to errors in the
+*   assumed inductance and output capacitance.
+*
+*   This routine uses the real component values to compute the real new
+*   output voltage and inductor ending current.  The real output voltage is
+*   written to VOUT, since the controller outright measures that.  The real
+*   inductor ending current is left in IACT, which is only used to compute
+*   the real circuit response next pulse.
+}
+procedure update_actual;               {update actual circuit values}
+  val_param; internal;
+
+var
+  v: real;                             {scratch voltage}
+  a: real;                             {scratch current, A}
+  q: real;                             {scratch charge, C}
+  t: real;                             {scratch time, s}
+
+begin
+  v := vin - vout;                     {voltage on inductor during on time}
+  a := iact + (v * ton / lact);        {inductor current at end of on time}
+  q := ton * (iact + a) / 2.0;         {charge delivered during on time}
+
+  v := vout + vd;                      {back voltage on inductor during discharge}
+  t := a * lact / v;                   {time for inductor to totally discharge}
+  if (ton + t) <= tp
+    then begin                         {discontinuous mode}
+      iact := 0.0;                     {set ending inductor current}
+      q := q + (t * a / 2.0);          {add charge delivered during discharge}
+      end
+    else begin                         {continuous mode}
+      t := tp - ton;                   {inductor discharge time}
+      iact := a - (v * t / lact);      {inductor current at end of pulse}
+      q := q + t * (a + iact) / 2.0;   {add charge delivered during discharge}
+      end
+    ;
+{
+*   IACT has been set.  This is the current in the inductor at the end of the
+*   pulse.
+*
+*   Q is the total charge delivered thru the inductor this period.  Now use that
+*   to update the output voltage.
+}
+  q := q - load * tp;                  {remove charge that went to the load}
+  v := q / cact;                       {output cap V change do to remaining charge}
+  vout := vout + v;                    {update the actual output voltage}
   end;
 {
 ****************************************************************************
@@ -442,9 +519,9 @@ var
 
 begin
   if compq then begin                  {automatically compute desired charge ?}
-    q := (vlast - vprev) * cap;        {total charge added to cap last pulse}
+    q := (vlast - vprev) * cass;       {total charge added to cap last pulse}
     ld := qlast - q;                   {charge comsumed by the load}
-    q := (vreg - vlast) * cap;         {charge to get cap to desired level}
+    q := (vreg - vlast) * cass;        {charge to get cap to desired level}
     qp := q + ld;                      {total charge to get to level and supply load}
     qp := qp + ld;                     {charge assumed to be used by load last pulse}
     qp := qp - qd;                     {minus charge delivered last pulse}
@@ -466,8 +543,7 @@ begin
 }
   vprev := vlast;                      {promote existing voltages one pulse back}
   vlast := vout;
-  q := load * tp;                      {charge comsumed by the load}
-  vout := vout + (qd - q) / cap;       {update output voltage to after this pulse}
+  update_actual;                       {compute actual circuit response to pulse}
 {
 *   Write info about this pulse.
 }
@@ -500,7 +576,14 @@ begin
 {
 *   Set defaults.
 }
-  l := 100.0e-6;                       {inductance}
+  lact := 100.0e-6;                    {actual inductance}
+  errl := 0.0;
+  lass := lact * (1.0 + errl);         {inductance assumed by the algorithm}
+
+  cact := 470.0e-6;                    {output capacitance}
+  errc := 0.0;
+  cass := cact * (1.0 + errc);         {capacitance assumed by the algorithm}
+
   sat := 2.0;                          {inductor saturation current}
   tp := 10.0e-6;                       {10 us period, 100 kHz}
   ton := tp / 4.0;
@@ -510,7 +593,6 @@ begin
   vout := 0.0;
   vd := 0.5;
   minon := 500.0e-9;                   {init min allowed pulse}
-  cap := 470.0e-6;                     {output capacitance}
   vreg := 5.0;                         {output regulation value}
   load := 0.0;                         {init power supply output load}
   qd := 0.0;
@@ -568,8 +650,8 @@ loop_cmd:
   writeln ('HELP or ?      - Show this list of commands');
 
   writeln ('VREG volts     - Set output regulation level (desired output)');
-  writeln ('CAP uF         - Set output capacitor size');
-  writeln ('L uHenry       - Set inductor value');
+  writeln ('CAP uF [err%]  - Set output capacitor size');
+  writeln ('L uH [err%]    - Set inductor value');
   writeln ('SAT amps       - Set inductor saturation current');
   writeln ('DD volts       - Set diode drop for inductor discharge');
   writeln ('VIN volts      - Set input voltage');
@@ -630,14 +712,20 @@ loop_cmd:
 {
 **********
 *
-*   L uHenry
+*   L uHenry [err percent]
 }
 7: begin
   r1 := next_fp (stat);
   if sys_error(stat) then goto err_cmparm;
-  if not_eos then goto err_extra;
+  r2 := next_fp (stat);
+  if not string_eos(stat) then begin
+    if sys_error(stat) then goto err_cmparm;
+    if not_eos then goto err_extra;
+    errl := r2 / 100.0;                {save new inductor error fraction}
+    end;
 
-  l := r1 * 1.0e-6;                    {update inductance in Henries}
+  lact := r1 * 1.0e-6;                 {update inductance in Henries}
+  lass := lact * (1.0 + errl);         {update inductance assumed by algorithm}
   show_state;
   end;
 {
@@ -651,6 +739,7 @@ loop_cmd:
   if not_eos then goto err_extra;
 
   i1 := r1;                            {set new inductor initial current}
+  iact := r1;
   show_state;
   end;
 {
@@ -756,14 +845,20 @@ loop_cmd:
 {
 **********
 *
-*   CAP uF
+*   CAP uF [err percent]
 }
 16: begin
-  r1 := next_fp (stat);
+  r1 := next_fp (stat);                {capacitance}
   if sys_error(stat) then goto err_cmparm;
-  if not_eos then goto err_extra;
+  r2 := next_fp (stat);                {error percent}
+  if not string_eos(stat) then begin
+    if sys_error(stat) then goto err_cmparm;
+    if not_eos then goto err_extra;
+    errc := r2 / 100.0;                {save new capacitor error fraction}
+    end;
 
-  cap := r1 * 1.0e-6;
+  cact := r1 * 1.0e-6;                 {update actual capacitance, Farads}
+  cass := cact * (1.0 + errc);         {update capacitance assumed by algorithm}
   show_state;
   end;
 {
