@@ -10,5 +10,6 @@ set fwname=pbptest
 set pictype=33EP32MC202
 set picclass=dsPIC
 set t_parms=-qv
-make_debug "C:\embed\src\pbp\debug_pbp.bat"
-call "C:\embed\src\pbp\debug_pbp.bat"
+call treename_var "(cog)src/%srcdir%/debug_%fwname%.bat" tnam
+make_debug "%tnam%"
+call "%tnam%"
